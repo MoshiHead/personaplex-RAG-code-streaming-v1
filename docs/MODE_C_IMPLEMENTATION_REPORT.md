@@ -104,6 +104,22 @@ local validation above) or whether the injected tokens simply failed to influenc
 (which would be a real, interesting negative result about how PersonaPlex weighs the persona prompt
 vs. an injected mid-prompt knowledge block — worth its own report section if it happens).
 
+## 3b. First live-pod run hit a real bug: GPU contention with the still-running server
+
+Your first run on the RTX 5090 pod failed both the baseline and Mode C cells with
+`torch.OutOfMemoryError`, before reaching any RAG-specific code. Root cause: `moshi.offline` loads
+its own full copy of the 7B model in a *separate OS process*, and Section 10's live server
+(`server_proc`) was still running in the background holding its own full copy (~19 GiB of the
+31.36 GiB card, per your traceback) -- two full model copies don't fit on one RTX 5090
+simultaneously. This wasn't a RAG bug; it would have failed identically for any offline.py
+invocation while the server is up.
+
+**Fixed**: added a new cell ("Free GPU memory before running the offline A/B experiment", just
+before Section 20's Run A) that detects and stops `server_proc` if it's still alive, plus an
+`nvidia-smi` memory check printed immediately after, so any future OOM at this point is
+diagnosable from the cell output directly rather than several cells later. Re-run Section 10 to
+restart the live server afterward if you still want the web UI.
+
 ## 4. Recommendation
 
 Per your instruction, **do not proceed to Modes B/D/E/F yet**. Next action is yours: run Sections
