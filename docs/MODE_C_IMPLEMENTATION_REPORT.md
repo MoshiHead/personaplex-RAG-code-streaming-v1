@@ -12,7 +12,7 @@ shaped the validation design. Read this before deciding whether to proceed to Mo
 | `rag/vector_store.py` | `FaissVectorStore`: create/save/load/update/delete over a FAISS `IndexIDMap(IndexFlatIP)`. Chroma recognized but raises `NotImplementedError` (not built yet, per the brief's stated priority). |
 | `rag/retriever.py` | `Retriever.retrieve_context(query, top_k, ...)` → `{"query", "contexts", "scores"}`, plus document ingestion (`build_index_from_documents`). |
 | `rag/data/aero_rentals_kb.json` | 10-document test knowledge base extending the README's "AeroRentals Pro" persona with facts the bare persona prompt doesn't contain (cancellation policy, deposits, insurance, license requirements, late fees, weather policy, etc). |
-| `rag/data/aero_rentals_question_cancellation.wav` (+ `.txt`) | A synthesized (Windows SAPI) spoken question — *"Hi, I need to cancel my drone rental tomorrow morning. What is your cancellation policy?"* — used as the offline.py input for the A/B experiment. |
+| `assets/test/aero_rentals_question_cancellation.wav` (+ `.txt`) | A synthesized (Windows SAPI) spoken question — *"Hi, I need to cancel my drone rental tomorrow morning. What is your cancellation policy?"* — used as the offline.py input for the A/B experiment. Placed under `assets/test/`, not `rag/data/`, because the repo's `.gitignore` blanket-ignores `*.wav` except under `assets/**` — see Section 3c below. |
 | `rag/build_index.py` | CLI/function: knowledge-base JSON → embeddings → FAISS index → saved to disk. |
 | `rag/logging_utils.py` | `RequestLogRecord`/`RequestLogger` (JSONL per-request log) + `inspect_kv_cache()` (best-effort, defensive, read-only `RingKVCache` introspection for logging). |
 | `rag/benchmark.py` | `TurnBenchmark` + `summarize()` (mean/p50/p95 over retrieval/injection/generation/total latency). |
@@ -119,6 +119,24 @@ before Section 20's Run A) that detects and stops `server_proc` if it's still al
 `nvidia-smi` memory check printed immediately after, so any future OOM at this point is
 diagnosable from the cell output directly rather than several cells later. Re-run Section 10 to
 restart the live server afterward if you still want the web UI.
+
+## 3c. Second live-pod run hit a real bug: the question WAV never made it to the pod
+
+After fixing 3b, the baseline run got past model loading and the persona/voice prompt phase, then
+failed at `lm_load_audio(input_wav, ...)` with `No such file or directory` for
+`rag/data/aero_rentals_question_cancellation.wav`. Root cause: this repo's `.gitignore` has a
+blanket `*.wav` rule, with only `assets/**` explicitly re-included (`!assets/` / `!assets/**`).
+The question WAV was placed under `rag/data/`, outside that exception, so whatever git-based
+mechanism moved this repo onto the RunPod pod silently dropped it — every other new file in `rag/`
+(`.py`, `.json`) is untouched by `.gitignore` and made it through fine, which is why the failure
+only affected this one binary asset.
+
+**Fixed**: moved `aero_rentals_question_cancellation.wav` (and its `.txt` companion) from
+`rag/data/` to `assets/test/`, alongside the repo's existing `input_assistant.wav`/
+`input_service.wav`/`prompt_service.txt` — the same convention already proven to survive a clone
+(Section 12's offline smoke test has used `assets/test/input_assistant.wav` successfully from the
+start). Updated the notebook's `AERO_QUESTION_WAV` path and the Section 20 markdown accordingly.
+No other binary assets exist under `rag/` today, so this was the only file affected.
 
 ## 4. Recommendation
 
