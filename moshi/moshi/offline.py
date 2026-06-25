@@ -333,8 +333,8 @@ def run_inference(
             rag_record = rag_session.inject_standard_prompt_rag(rag_query)
         else:
             # Mode D: nothing is injected yet -- this only retrieves and arms the knowledge block
-            # that observe_user_frame()/consume_one_tick() will inject incrementally below, once
-            # per detected pause in the input WAV's own audio (step 9).
+            # that observe_user_frame()/fire_turn_injection_burst() will inject as a self-contained
+            # burst below, once per detected pause in the input WAV's own audio (step 9).
             rag_record = rag_session.prepare_turn_injection_knowledge(rag_query)
         log(
             "info",
@@ -363,7 +363,7 @@ def run_inference(
     # advances exactly once per outer-loop iteration. Used only by Mode D (turn_injection) to feed
     # the turn-boundary detector the *raw* PCM, which the encode/step pipeline below never exposes
     # directly (it only ever sees the already-Mimi-encoded tokens). For every other mode (or when
-    # RAG is disabled), `observe_user_frame`/`consume_one_tick` are no-ops -- see RAGSession.
+    # RAG is disabled), `observe_user_frame` is a no-op -- see RAGSession.
     frame_idx = 0
 
     for user_encoded in lm_encode_from_sphn(
@@ -376,8 +376,19 @@ def run_inference(
         if rag_enable:
             frame_start = frame_idx * lm_gen._frame_size
             raw_frame = user_audio[0, frame_start : frame_start + lm_gen._frame_size]
-            rag_session.observe_user_frame(raw_frame)
-            rag_session.consume_one_tick()
+            # If a turn boundary is detected, fire the prepared knowledge as ONE self-contained
+            # burst right here, BEFORE this frame's real lm_gen.step() call below -- never
+            # interleaved with it. See the warning in rag/injection_manager.py and
+            # docs/MODE_D_REDESIGN.md for why a real run showed interleaving corrupts both the
+            # transcript and the spoken audio.
+            if rag_session.observe_user_frame(raw_frame):
+                turn_record = rag_session.fire_turn_injection_burst()
+                log(
+                    "info",
+                    f"[rag] turn boundary detected -> fired burst: "
+                    f"injected_tokens={turn_record['injected_token_count']} "
+                    f"injection_latency_s={turn_record.get('injection_latency_s')}",
+                )
             frame_idx += 1
 
         # user_encoded: [1, K, T]. Feed one step at a time (usually T==1)

@@ -5,6 +5,7 @@ Unit tests for rag.server_integration.RAGSession, using the same plain-Python `F
 dependencies being installed.
 """
 
+import asyncio
 import shutil
 import tempfile
 import unittest
@@ -308,8 +309,9 @@ def _silence_frame(n=1920):
 
 
 class TestRAGSessionModeD(unittest.TestCase):
-    """Mode D: turn-boundary-triggered incremental injection. Uses RAGConfig's default
-    TurnDetectorConfig (6-frame silence hangover) via vad_enabled=True."""
+    """Mode D: turn-boundary-triggered BURST injection (redesigned after a real run showed
+    incremental per-tick interleaving corrupts both the transcript and the spoken audio -- see
+    docs/MODE_D_REDESIGN.md). `observe_user_frame()` only detects; the caller fires the burst."""
 
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
@@ -355,7 +357,7 @@ class TestRAGSessionModeD(unittest.TestCase):
         self.assertFalse(any(fired))
         self.assertEqual(len(lm_gen.calls), 0)
 
-    def test_turn_boundary_queues_injection_after_preparation(self):
+    def test_observe_user_frame_detects_boundary_but_does_not_inject_itself(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.9]})
         session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
         record = session.prepare_turn_injection_knowledge("a question")
@@ -363,7 +365,9 @@ class TestRAGSessionModeD(unittest.TestCase):
 
         fired = self._speak_then_pause(session)
         self.assertEqual(sum(fired), 1)
-        self.assertIsNotNone(session.pending_job)
+        # Detecting a boundary must not, by itself, force anything through the model -- only
+        # fire_turn_injection_burst()/_async() does that.
+        self.assertEqual(len(lm_gen.calls), 0)
 
     def test_prepare_uses_turn_injection_top_k_not_top_k(self):
         seen_top_k = []
@@ -383,58 +387,87 @@ class TestRAGSessionModeD(unittest.TestCase):
 
         self.assertEqual(seen_top_k, [2])
 
-    def test_does_not_stack_a_second_injection_while_one_is_pending(self):
-        retriever = FakeRetriever({"query": "q", "contexts": ["a fairly long fact to inject"], "scores": [0.9]})
-        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
-        record = session.prepare_turn_injection_knowledge("a question")
-        session.finalize_and_log(record)
-
-        self._speak_then_pause(session)
-        self.assertIsNotNone(session.pending_job)
-        job_before = session.pending_job
-
-        # A second boundary fires while the first injection is still draining (no consume_one_tick
-        # calls in between) -- it must NOT replace/stack on top of the still-pending job.
-        self._speak_then_pause(session)
-        self.assertIs(session.pending_job, job_before)
-
-    def test_full_cycle_drains_via_consume_one_tick_and_logs_completion(self):
+    def test_fire_turn_injection_burst_forces_all_tokens_and_logs_one_row(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["ab"], "scores": [0.9]})
         session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
         record = session.prepare_turn_injection_knowledge("a question")
         session.finalize_and_log(record)
 
-        self._speak_then_pause(session)
-        self.assertIsNotNone(session.pending_job)
+        fired = self._speak_then_pause(session)
+        self.assertEqual(sum(fired), 1)
 
-        while session.pending_job is not None:
-            session.consume_one_tick()
+        result = session.fire_turn_injection_burst()
 
+        self.assertEqual(result["mode"], "turn_injection")
+        self.assertEqual(result["injection_strategy"], "turn_injection (burst, fired on detected turn boundary)")
         self.assertGreater(len(lm_gen.calls), 0)
+        self.assertEqual(result["injected_token_count"], len(lm_gen.calls))
         self.assertFalse(lm_gen.reset_streaming_called)
 
         rows = session.logger.read_all()
-        completion_rows = [r for r in rows if r["injection_strategy"] == "incremental (per-tick, opus_loop)"]
-        self.assertEqual(len(completion_rows), 1)
-        self.assertEqual(completion_rows[0]["mode"], "turn_injection")
+        burst_rows = [r for r in rows if r["injection_strategy"].startswith("turn_injection (burst")]
+        self.assertEqual(len(burst_rows), 1)
 
-    def test_can_fire_again_after_the_previous_injection_finishes(self):
+    def test_can_fire_again_after_a_later_boundary(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["x"], "scores": [0.9]})
         session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
         record = session.prepare_turn_injection_knowledge("a question")
         session.finalize_and_log(record)
 
         self._speak_then_pause(session)
-        while session.pending_job is not None:
-            session.consume_one_tick()
+        session.fire_turn_injection_burst()
         first_cycle_calls = len(lm_gen.calls)
 
         fired_again = self._speak_then_pause(session)
         self.assertEqual(sum(fired_again), 1)
-        self.assertIsNotNone(session.pending_job)
-        while session.pending_job is not None:
-            session.consume_one_tick()
+        session.fire_turn_injection_burst()
         self.assertGreater(len(lm_gen.calls), first_cycle_calls)
+
+        rows = session.logger.read_all()
+        burst_rows = [r for r in rows if r["injection_strategy"].startswith("turn_injection (burst")]
+        self.assertEqual(len(burst_rows), 2)
+
+
+class TestRAGSessionModeDAsyncBurst(unittest.IsolatedAsyncioTestCase):
+    """Async-checkpointed equivalent of the burst, for moshi.server's opus_loop."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.TURN_INJECTION, vad_enabled=True,
+            turn_injection_top_k=2, log_dir=self.tmp_dir,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    async def test_async_burst_forces_tokens_and_logs_same_as_sync(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_turn_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        result = await session.fire_turn_injection_burst_async()
+
+        self.assertEqual(result["injection_strategy"], "turn_injection (burst, fired on detected turn boundary)")
+        self.assertGreater(len(lm_gen.calls), 0)
+        self.assertFalse(lm_gen.reset_streaming_called)
+
+    async def test_async_burst_does_not_starve_other_coroutines(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["a somewhat longer fact to inject here"], "scores": [0.9]})
+        session, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_turn_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        other_task_ticks = []
+
+        async def other_task():
+            for i in range(5):
+                other_task_ticks.append(i)
+                await asyncio.sleep(0)
+
+        await asyncio.gather(session.fire_turn_injection_burst_async(), other_task())
+        self.assertEqual(other_task_ticks, [0, 1, 2, 3, 4])
 
 
 class TestRAGSessionIncrementalQueue(unittest.TestCase):

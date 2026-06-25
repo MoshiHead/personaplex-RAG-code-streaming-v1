@@ -73,6 +73,7 @@ class RAGSession:
         if config.enable_rag and config.injection_mode == InjectionMode.TURN_INJECTION and config.vad_enabled:
             self.turn_detector = TurnBoundaryDetector()
         self._turn_injection_request: Optional[InjectionRequest] = None
+        self._turn_injection_query: Optional[str] = None
 
     # ---- Shared retrieval step for any connection-start mode (B or C) -----------------------
     def _retrieve_for_injection(self, query: str, mode: str) -> tuple[RequestLogRecord, Optional[dict]]:
@@ -210,22 +211,32 @@ class RAGSession:
         )
         return record.to_dict()
 
-    # ---- Mode D: turn-boundary-triggered incremental injection -----------------------------
+    # ---- Mode D: turn-boundary-triggered burst injection -----------------------------------
+    #
+    # IMPORTANT (see docs/MODE_D_REDESIGN.md for the full investigation): an earlier version of
+    # this mode queued the prepared knowledge for *incremental*, one-forced-step-per-real-tick
+    # injection via queue_injection()/consume_one_tick(). A real run showed this corrupts both the
+    # visible transcript and the spoken audio -- forcing `text_token=X` always means "the model's
+    # output at this position IS X right now," not "X is new context the model may react to
+    # later," and the audio depformer conditions on whichever text token is active each frame.
+    # Interleaving forced steps with a real generation loop that is actively decoding/forwarding
+    # output therefore leaks the raw injected text (verbatim, `<system>` tags included) into both.
+    # The fix is to always inject as one self-contained burst -- identical in kind to Mode C's
+    # connection-start burst, just triggered later, by a detected pause instead of by the
+    # connection starting.
     def prepare_turn_injection_knowledge(self, query: str) -> dict:
         """Mode D setup. Retrieves context for `query` **once**, using the deliberately small
         `config.turn_injection_top_k` (not `config.top_k` -- see `RAGConfig.turn_injection_top_k`'s
         docstring on why per-turn re-injection must stay short), and holds the resulting
-        `<system>...<system>`-wrapped knowledge block ready for repeated incremental injection.
+        `<system>...<system>`-wrapped knowledge block ready to be re-fired as a burst on every
+        detected turn boundary (see `fire_turn_injection_burst`/`_async`).
 
-        Unlike Mode C/B, this method does **not** push anything through the model itself -- no
-        tokens are forced here, so `injected_token_count`/`injection_latency_s` stay at their
-        defaults in the returned record. The actual injections happen later, one per detected
-        turn boundary, via `observe_user_frame()` + `consume_one_tick()`.
-
-        Intended call site: same as Mode C/B (right after `step_system_prompts_async` completes,
-        still inside the connection's lock, before opus_loop starts) -- but instead of injecting,
-        this just arms the mechanism. Call `finalize_and_log(record)` on the result the same way
-        as the other modes.
+        This method itself does **not** push anything through the model -- no tokens are forced
+        here, so `injected_token_count`/`injection_latency_s` stay at their defaults in the
+        returned record. Intended call site: same as Mode C/B (right after
+        `step_system_prompts_async` completes, still inside the connection's lock, before
+        opus_loop starts). Call `finalize_and_log(record)` on the result the same way as the
+        other modes.
         """
         record = RequestLogRecord(mode=InjectionMode.TURN_INJECTION.value, user_query=query)
 
@@ -251,8 +262,9 @@ class RAGSession:
         self._turn_injection_request = InjectionRequest(
             text=knowledge_block, mode=InjectionMode.TURN_INJECTION.value, wrap_system_tags=True
         )
+        self._turn_injection_query = query
         record.injection_strategy = (
-            "turn_injection (prepared; injected incrementally on each detected turn boundary)"
+            "turn_injection (prepared; fired as a burst on each detected turn boundary)"
         )
         record.context_length_chars = len(knowledge_block)
         record.prompt_length_chars = len(wrap_with_system_tags(knowledge_block))
@@ -264,11 +276,11 @@ class RAGSession:
         has already armed a knowledge block -- safe to call unconditionally every frame in any
         mode.
 
-        On a detected boundary, queues the prepared turn-injection knowledge for incremental
-        consumption via `consume_one_tick()`, UNLESS a previous injection is still draining
-        (checked via `self.pending_job`) -- this deliberately avoids stacking a second injection
-        on top of one that hasn't finished, which would otherwise grow unboundedly if the user
-        pauses more often than a single injection takes to drain.
+        Returns True iff a turn boundary was just detected. This method only *detects* -- it does
+        not inject anything itself. The caller must then fire the burst (`fire_turn_injection_burst()`
+        synchronously, or `await fire_turn_injection_burst_async()`) **before** processing the
+        current real audio frame any further, so the burst always completes as a self-contained
+        unit rather than being interleaved with real generation (see the module-level note above).
 
         Must be called from the same coroutine that owns `lm_gen.step()` for this connection (the
         same constraint as everything else in this class) -- in the reference server, that's
@@ -277,12 +289,54 @@ class RAGSession:
         """
         if self.turn_detector is None or self._turn_injection_request is None:
             return False
+        return self.turn_detector.push_frame(pcm_frame)
 
-        boundary = self.turn_detector.push_frame(pcm_frame)
-        if boundary and self.pending_job is None:
-            self.queue_injection(self._turn_injection_request)
-            return True
-        return False
+    def fire_turn_injection_burst(self) -> dict:
+        """Mode D: fires the prepared turn-injection knowledge as ONE synchronous blocking burst
+        (same underlying mechanism as Mode C's `inject_persona_compatible_knowledge` --
+        `TokenInjector.run_to_completion`), triggered by a detected turn boundary instead of
+        connection start. For `moshi.offline`, which has no event loop to share. For the live
+        server, use `fire_turn_injection_burst_async()` instead so the burst doesn't freeze the
+        whole asyncio event loop.
+
+        Logs and returns the completed record immediately (no `finalize_and_log` step needed --
+        unlike Mode B/C, there is no separate bounded "generation phase" to wait for; the burst
+        itself is the entire unit of work for this call).
+        """
+        record = RequestLogRecord(
+            mode=InjectionMode.TURN_INJECTION.value, user_query=self._turn_injection_query
+        )
+        t0 = time.monotonic()
+        stats = self.injector.run_to_completion(self._turn_injection_request)
+        injection_latency_s = time.monotonic() - t0
+
+        record.injection_strategy = "turn_injection (burst, fired on detected turn boundary)"
+        record.injected_token_count = stats.token_count
+        record.injection_latency_s = injection_latency_s
+        record.total_latency_s = injection_latency_s
+        record.kv_cache_status = inspect_kv_cache(self._lm_gen)
+
+        self.logger.log(record)
+        return record.to_dict()
+
+    async def fire_turn_injection_burst_async(self) -> dict:
+        """Async-checkpointed equivalent of `fire_turn_injection_burst`, for `moshi.server`'s
+        `opus_loop` -- see `TokenInjector.run_to_completion_async`. Identical fields/logging."""
+        record = RequestLogRecord(
+            mode=InjectionMode.TURN_INJECTION.value, user_query=self._turn_injection_query
+        )
+        t0 = time.monotonic()
+        stats = await self.injector.run_to_completion_async(self._turn_injection_request)
+        injection_latency_s = time.monotonic() - t0
+
+        record.injection_strategy = "turn_injection (burst, fired on detected turn boundary)"
+        record.injected_token_count = stats.token_count
+        record.injection_latency_s = injection_latency_s
+        record.total_latency_s = injection_latency_s
+        record.kv_cache_status = inspect_kv_cache(self._lm_gen)
+
+        self.logger.log(record)
+        return record.to_dict()
 
     def finalize_and_log(
         self,
@@ -316,21 +370,27 @@ class RAGSession:
         self.logger.log(RequestLogRecord(**record))
         return record
 
-    # ---- Modes D/E/F: incremental, per-tick consumption from opus_loop ---------------------
+    # ---- Generic incremental primitives -- NOT currently used by any mode ------------------
+    #
+    # CAUTION: do not wire these into a loop that also decodes/forwards real generation output
+    # without first suppressing that output for the duration of the drain. Mode D originally used
+    # exactly this pattern and it corrupted both the transcript and the spoken audio -- see the
+    # warning at the top of the "Mode D" section above and docs/MODE_D_REDESIGN.md. Kept as a
+    # tested, lower-level primitive (e.g. for a future mode that has a legitimate reason to spread
+    # a burst across ticks *and* correctly suppresses output during the drain), not as the
+    # recommended way to do mid-conversation injection.
     def queue_injection(self, request: InjectionRequest) -> None:
-        """Queue an `InjectionRequest` for incremental consumption. Must be called from the same
-        coroutine that will later call `consume_one_tick()` (i.e. `opus_loop`'s own execution
-        context) -- see `TokenInjector`'s class docstring. Not used by Mode C (which injects in one
-        blocking burst before `opus_loop` even starts); reserved for Modes D/E/F."""
+        """Queue an `InjectionRequest` for incremental consumption via `consume_one_tick()`. See
+        the CAUTION above before reaching for this over a burst
+        (`TokenInjector.run_to_completion`/`run_to_completion_async`)."""
         self.pending_job = self.injector.start(request)
 
     def consume_one_tick(self) -> bool:
-        """Call once per `opus_loop` iteration, BEFORE draining real audio for that tick (see
-        docs/STREAMING_AND_INJECTION_DESIGN.md Section 3.2). Executes at most one forced step.
+        """Executes at most one forced step from a job queued via `queue_injection()`. See the
+        CAUTION above before reaching for this over a burst.
 
         Returns True if a step was executed. Safe to call even when there is no pending job
-        (no-op, returns False) -- this is what makes the `opus_loop` hook inert for
-        `ENABLE_RAG=False` and for Mode C (which never populates `pending_job`).
+        (no-op, returns False).
         """
         if self.pending_job is None:
             return False

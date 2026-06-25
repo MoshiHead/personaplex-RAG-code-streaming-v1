@@ -6,6 +6,7 @@ blocking usage) is correct in isolation, which is the whole point of designing t
 no hard dependency on `moshi`/`torch` in the first place.
 """
 
+import asyncio
 import unittest
 
 from rag.injection_manager import (
@@ -160,6 +161,59 @@ class TestTokenInjectorIncremental(unittest.TestCase):
         incremental_tokens = [c["text_token"] for c in incremental_lm_gen.calls]
         blocking_tokens = [c["text_token"] for c in blocking_lm_gen.calls]
         self.assertEqual(incremental_tokens, blocking_tokens)
+
+
+class TestTokenInjectorAsyncBurst(unittest.IsolatedAsyncioTestCase):
+    async def test_async_burst_forces_identical_tokens_to_sync_burst(self):
+        text = "identical content for async vs sync"
+
+        sync_lm_gen = FakeLMGen()
+        sync_injector = TokenInjector(sync_lm_gen, FakeTokenizer(), lambda: "Z", lambda: "S")
+        sync_injector.run_to_completion(InjectionRequest(text=text, wrap_system_tags=False))
+
+        async_lm_gen = FakeLMGen()
+        async_injector = TokenInjector(async_lm_gen, FakeTokenizer(), lambda: "Z", lambda: "S")
+        await async_injector.run_to_completion_async(InjectionRequest(text=text, wrap_system_tags=False))
+
+        sync_tokens = [c["text_token"] for c in sync_lm_gen.calls]
+        async_tokens = [c["text_token"] for c in async_lm_gen.calls]
+        self.assertEqual(sync_tokens, async_tokens)
+
+    async def test_async_burst_never_calls_reset_streaming(self):
+        lm_gen = FakeLMGen()
+        injector = TokenInjector(lm_gen, FakeTokenizer(), lambda: "Z", lambda: "S")
+        await injector.run_to_completion_async(InjectionRequest(text="some knowledge"))
+        self.assertFalse(lm_gen.reset_streaming_called)
+
+    async def test_async_burst_returns_correct_stats(self):
+        lm_gen = FakeLMGen()
+        injector = TokenInjector(lm_gen, FakeTokenizer(), lambda: "Z", lambda: "S")
+        stats = await injector.run_to_completion_async(
+            InjectionRequest(text="hi", mode="turn_injection", wrap_system_tags=False)
+        )
+        self.assertEqual(stats.mode, "turn_injection")
+        self.assertEqual(stats.token_count, 2)
+        self.assertEqual(stats.steps_executed, 2)
+        self.assertTrue(stats.finished)
+
+    async def test_async_burst_yields_control_between_steps(self):
+        # Prove other tasks on the event loop actually get a turn during the burst -- this is the
+        # entire point of the async variant over a tight synchronous loop.
+        lm_gen = FakeLMGen()
+        injector = TokenInjector(lm_gen, FakeTokenizer(), lambda: "Z", lambda: "S")
+
+        other_task_ticks = []
+
+        async def other_task():
+            for i in range(5):
+                other_task_ticks.append(i)
+                await asyncio.sleep(0)
+
+        await asyncio.gather(
+            injector.run_to_completion_async(InjectionRequest(text="abcde", wrap_system_tags=False)),
+            other_task(),
+        )
+        self.assertEqual(other_task_ticks, [0, 1, 2, 3, 4])
 
 
 if __name__ == "__main__":

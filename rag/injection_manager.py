@@ -18,6 +18,17 @@ constraints this module is built around:
     discipline, not something a lock here can enforce.
   - Injecting must NEVER call `reset_streaming()` -- that wipes the entire live conversation's
     RingKVCache (persona prompt, voice prompt, and all prior turns), not just "the prompt".
+  - CRITICAL (found via a real Mode D run -- see docs/MODE_D_REDESIGN.md): forcing
+    `text_token=X` via `step()` does not mean "show the model X as context it can choose to react
+    to later." It means "the model's output at this position IS X, right now" -- the audio
+    depformer also conditions on whichever text token is active each frame, forced or not. This
+    is harmless ONLY when nothing reads/forwards `step()`'s resolved output while forcing happens
+    (true for the persona prompt and for `run_to_completion`/`run_to_completion_async` when called
+    *before* a real generation loop starts watching output, as Modes B/C do). It actively corrupts
+    both the visible transcript and the spoken audio if forced steps are interleaved with a real
+    generation loop that IS reading output at the same time -- do not build an "incremental,
+    one-forced-step-per-real-tick" injection mode; always inject as one self-contained burst
+    (`run_to_completion`/`run_to_completion_async`), even if triggered mid-conversation (Mode D).
 
 This module intentionally has zero dependency on `moshi`, `torch`, or any vector-store/embedding
 library, so it is fully unit-testable with plain Python stand-ins (see
@@ -27,6 +38,7 @@ decision of *when* to call it and *what text* to inject is the caller's policy, 
 concern.
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 import time
@@ -107,22 +119,27 @@ class TokenInjector:
     mechanism PersonaPlex uses for its own persona/system prompt
     (`moshi.models.lm.LMGen._step_text_prompt_core`), without ever calling `reset_streaming()`.
 
-    Two usage patterns (see docs/STREAMING_AND_INJECTION_DESIGN.md Section 3.3 for when to pick
-    which):
+    Always inject as a self-contained burst, never interleaved with a real generation loop that
+    is concurrently reading/forwarding `step()`'s output (see the CRITICAL note above and
+    docs/MODE_D_REDESIGN.md) -- two burst variants, depending on whether the caller has an
+    asyncio event loop to share:
 
-    Blocking burst -- mirrors how the original system prompt is loaded; simplest, but the full
-    cost is paid in one go::
+    Synchronous burst (e.g. `moshi.offline`, which has no event loop)::
 
         injector = TokenInjector(lm_gen, text_tokenizer, make_zero_audio_frame, make_silence_audio_frame)
         stats = injector.run_to_completion(InjectionRequest(text="...", mode="persona_rag"))
 
-    Incremental -- spreads the same forced steps across many `opus_loop` ticks so no single tick
-    is blocked for the full duration::
+    Async-checkpointed burst (e.g. `moshi.server`'s `opus_loop`) -- functionally identical, but
+    yields control after each forced step so other coroutines (`recv_loop`/`send_loop`) aren't
+    starved for the whole burst, mirroring `LMGen._step_text_prompt_async`'s pattern::
 
-        job = injector.start(InjectionRequest(text="...", mode="dynamic_runtime"))
-        # from inside opus_loop's existing while-loop, once per tick, before draining real audio:
-        if not job.done:
-            job.step_once()
+        stats = await injector.run_to_completion_async(InjectionRequest(text="...", mode="turn_injection"))
+
+    `start()`/`InjectionJob.step_once()` remain available as lower-level primitives (e.g. for a
+    caller that wants fine-grained control over exactly when each step fires), but do NOT use them
+    to spread an injection's steps across ticks of a loop that is also decoding/forwarding real
+    generation output -- that is exactly the interleaving pattern that caused the corruption
+    described above.
     """
 
     def __init__(
@@ -175,11 +192,33 @@ class TokenInjector:
         return InjectionJob(self, request, token_ids)
 
     def run_to_completion(self, request: InjectionRequest) -> InjectionStats:
-        """Convenience wrapper: push every token through in one blocking call. See the class
-        docstring for when to prefer the incremental `start()`/`step_once()` pattern instead."""
+        """Synchronous burst: push every token through in one blocking call, with no opportunity
+        for anything else to run in between. Use this when the caller has no event loop to share
+        (e.g. `moshi.offline`) or when blocking briefly is genuinely fine (e.g. Mode C/B's
+        connection-start injection, before any real generation loop is watching output)."""
         job = self.start(request)
         while not job.done:
             job.step_once()
+        return job.stats
+
+    async def run_to_completion_async(self, request: InjectionRequest) -> InjectionStats:
+        """Async-checkpointed burst: identical effect to `run_to_completion` (every token is
+        still forced through sequentially, in one self-contained burst, with no real generation
+        interleaved in between -- see the class docstring's CRITICAL note on why that matters),
+        but yields control via `await asyncio.sleep(0)` after each forced step so other
+        coroutines on the same event loop (e.g. `recv_loop`/`send_loop` in `moshi.server`) get a
+        chance to run during the burst, mirroring `LMGen._step_text_prompt_async`'s pattern.
+
+        This does NOT make the burst safe to run concurrently with another coroutine that also
+        calls `lm_gen.step()` -- the concurrency contract (Section 3.1 of
+        docs/STREAMING_AND_INJECTION_DESIGN.md) is unchanged: only one coroutine may ever drive
+        this `LMGen` instance. It only prevents that single coroutine's own burst from starving
+        *other* coroutines on the same event loop for the burst's full duration.
+        """
+        job = self.start(request)
+        while not job.done:
+            job.step_once()
+            await asyncio.sleep(0)
         return job.stats
 
     def _force_one_token(self, token_id) -> None:

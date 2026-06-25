@@ -267,16 +267,6 @@ class ServerState:
                     return
                 await asyncio.sleep(0.001)
 
-                # Incremental RAG injection point (Modes D/E/F). Executes at most one forced
-                # text-token step per tick, BEFORE draining real audio, and is a no-op when there
-                # is no queued job -- see docs/STREAMING_AND_INJECTION_DESIGN.md Section 3.2 for
-                # why this is the only safe place to do this (opus_loop is the sole coroutine that
-                # ever calls self.lm_gen.step()). Mode C/B never populate a pending job (they
-                # inject in one blocking burst before this loop starts, see above); Mode D's
-                # pending job is populated below, by observe_user_frame().
-                if self.rag_session is not None:
-                    self.rag_session.consume_one_tick()
-
                 pcm = opus_reader.read_pcm()
                 if pcm.shape[-1] == 0:
                     continue
@@ -290,9 +280,26 @@ class ServerState:
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     # Mode D: feed the *raw* user-audio frame to the turn-boundary detector before
                     # it's converted to a torch tensor below. No-op unless turn_injection + VAD are
-                    # both active (see RAGSession.observe_user_frame).
-                    if self.rag_session is not None:
-                        self.rag_session.observe_user_frame(chunk)
+                    # both active (see RAGSession.observe_user_frame). If a boundary just fired,
+                    # await the prepared knowledge as ONE self-contained, async-checkpointed burst
+                    # -- BEFORE this frame's real self.lm_gen.step() call below, never interleaved
+                    # with it. A real run showed interleaving forced steps with the real generation
+                    # loop corrupts both the transcript and the spoken audio (forcing text_token=X
+                    # always means "the model says X right now," not "X is new context" -- see
+                    # rag/injection_manager.py's warning and docs/MODE_D_REDESIGN.md). The async
+                    # variant yields between forced steps so recv_loop/send_loop aren't starved for
+                    # the whole burst, but still fully completes before this frame's real step --
+                    # opus_loop is the only coroutine that ever calls self.lm_gen.step(), so this
+                    # remains safe under the concurrency contract in
+                    # docs/STREAMING_AND_INJECTION_DESIGN.md Section 3.1.
+                    if self.rag_session is not None and self.rag_session.observe_user_frame(chunk):
+                        turn_record = await self.rag_session.fire_turn_injection_burst_async()
+                        clog.log(
+                            "info",
+                            f"[rag] turn boundary detected -> fired burst: "
+                            f"injected_tokens={turn_record['injected_token_count']} "
+                            f"injection_latency_s={turn_record.get('injection_latency_s')}",
+                        )
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
@@ -376,9 +383,9 @@ class ServerState:
                     rag_record = self.rag_session.inject_standard_prompt_rag(rag_query)
                 else:
                     # Mode D: nothing is injected here -- this only retrieves and arms the
-                    # knowledge block that opus_loop's observe_user_frame()/consume_one_tick()
-                    # calls (below) will inject incrementally on each detected turn boundary in
-                    # the live user audio.
+                    # knowledge block that opus_loop's observe_user_frame()/
+                    # fire_turn_injection_burst_async() calls (below) will inject as a
+                    # self-contained burst on each detected turn boundary in the live user audio.
                     rag_record = self.rag_session.prepare_turn_injection_knowledge(rag_query)
                 # No bounded "generation phase" to time here -- the live duplex conversation just
                 # keeps going after this point -- so finalize immediately with neither

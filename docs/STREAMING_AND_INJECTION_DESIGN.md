@@ -112,45 +112,48 @@ async def opus_loop():
             return
         await asyncio.sleep(0.001)
 
-        # >>> RECOMMENDED INSERTION POINT <<<
-        # If ENABLE_RAG and there is a pending InjectionJob for this connection, execute a small,
-        # bounded number of forced steps here -- BEFORE draining any real buffered audio below.
-        # This keeps the change additive: when there is no pending job (ENABLE_RAG=False, or no mode
-        # has queued anything), this branch is a single cheap "is there a job?" check and behavior is
-        # byte-for-byte identical to the current server.
-
         pcm = opus_reader.read_pcm()
-        ... # unchanged real-audio handling
+        ... # real-audio handling, with one addition (see Section 3.3): right where a raw PCM
+            # frame is sliced off, check the turn-boundary detector; if it just fired, `await` the
+            # prepared knowledge as one self-contained burst (run_to_completion_async) BEFORE
+            # processing that frame's real lm_gen.step() call -- never interleaved with it. When
+            # there's nothing to detect (ENABLE_RAG=False, or no mode is using the detector), this
+            # is a single cheap check and behavior is byte-for-byte identical to the current
+            # server.
 ```
 
 Why this exact spot, and not elsewhere:
-- It is **before** the real-audio drain, so a queued injection gets priority within a tick rather than being
-  starved indefinitely by a busy mic stream — but because we only execute a *bounded* number of forced steps
-  per tick (Section 3.3), it never blocks real audio indefinitely either.
+- It is **before** the real-audio drain, so a detected turn boundary gets handled before that tick's real audio
+  is processed.
 - It requires **zero changes to `recv_loop`/`send_loop`** and **zero changes to the WebSocket protocol** — the
-  client keeps streaming audio in and out exactly as today; injected frames simply interleave into the existing
-  `lm_gen.step()` call sequence that already happens once per ~80ms tick.
-- It does not touch `mimi`/`other_mimi` at all for text-only injection (Modes B/C/D/E as scoped) — only
+  client keeps streaming audio in and out exactly as today; any incoming audio that arrives during a burst
+  simply queues in the existing buffers and gets processed right after, at the cost of the burst's latency.
+- It does not touch `mimi`/`other_mimi` at all for text-only injection — only
   `lm_gen.step(text_token=..., moshi_tokens=<silence>, input_tokens=<silence>)`, exactly mirroring
   `LMGen._step_text_prompt_core`.
 
-### 3.3 Why incremental (bounded-per-tick), not one blocking burst
+### 3.3 Why a self-contained burst, not incremental per-tick interleaving
 
-`step_system_prompts` already does the "one blocking burst" version at connection start — that's acceptable
-there because the model hasn't started listening yet (no live mic/duplex expectation is in flight). Mid-call,
-the user can be talking while we want to inject N tokens of knowledge. Two strategies, both supported by the
-same interface (Section 4):
-
-- **Blocking burst** (`TokenInjector.run_to_completion`): pushes all N tokens through immediately. Simulates
-  exactly what Mode B/C would do if implemented the "obvious" way. Expected to cause an audible pause of
-  `N × (per-step latency)` — this is the latency cost the team already observed, and we want to *measure* it
-  honestly, not hide it.
-- **Incremental** (`TokenInjector.start()` + `InjectionJob.step_once()` called 1× per `opus_loop` tick):
-  spreads the same N forced steps across many ticks, interleaved with real audio frames, capping how much any
-  single tick can be delayed. Total wall-clock time to finish the injection is the same or slightly longer, but
-  the perceptual experience (and worst-case single-frame latency) is smoother. This is the version we expect
-  Modes D/E/F to use in practice; Mode B/C benchmarks should report *both* strategies so the report can show the
-  actual latency/smoothness trade-off rather than asserting it.
+> **Superseded by a real finding — see [`docs/MODE_D_REDESIGN.md`](./MODE_D_REDESIGN.md) for the full
+> investigation.** This section originally argued for spreading an injection's forced steps one-per-tick across
+> many `opus_loop` iterations (`TokenInjector.start()` + `InjectionJob.step_once()`), reasoning only about
+> *latency smoothness*. A real Mode D run on the RTX 5090 pod showed that reasoning was incomplete: forcing
+> `text_token=X` doesn't mean "X is new context the model may react to" — it means "the model's output at this
+> position IS X, right now," and the audio depformer also conditions on whichever text token is active each
+> frame. Interleaving forced steps with a real generation loop that is actively decoding/forwarding output
+> therefore leaks the **raw** injected text (literal `<system>` tags included) into both the transcript and the
+> spoken audio — spreading it thinner across more ticks doesn't reduce that corruption, it just scatters it
+> across a longer stretch of the response instead of containing it to one moment.
+>
+> **Corrected guidance**: always inject as one self-contained burst — `TokenInjector.run_to_completion`
+> (synchronous, for callers with no event loop, e.g. `moshi.offline`) or
+> `TokenInjector.run_to_completion_async` (async-checkpointed — yields control after each forced step via
+> `await asyncio.sleep(0)`, mirroring `LMGen._step_text_prompt_async`'s pattern, so `recv_loop`/`send_loop`
+> aren't starved for the burst's duration — for `moshi.server`'s `opus_loop`). This applies even to Modes
+> triggered mid-conversation (D/E): the burst just fires *later* (on a detected pause, or on a timer) instead of
+> at connection start, not differently in kind from Mode C's burst. `start()`/`InjectionJob.step_once()` remain
+> available as a lower-level primitive, but must not be wired into a loop that also reads real generation output
+> without first ensuring that loop doesn't decode/forward output for the duration of the drain.
 
 ### 3.4 What "Cache-Aware RAG" (Mode F) actually means here
 
@@ -184,8 +187,10 @@ Implemented in [`rag/injection_manager.py`](../rag/injection_manager.py). Design
    logging/benchmarking; the actual stepping logic in `TokenInjector`/`InjectionJob` is mode-agnostic.
    Per-mode *policy* (when to build a request, what text to put in it, how often) lives one layer up, outside
    this module — this module only knows how to safely push tokens, not when or why.
-4. **Supports both usage patterns from Section 3.3** (`run_to_completion` for a blocking burst,
-   `start()`/`InjectionJob.step_once()` for bounded incremental use from inside `opus_loop`).
+4. **Supports both burst variants from the (corrected) Section 3.3** — `run_to_completion`
+   (synchronous) and `run_to_completion_async` (async-checkpointed, for `opus_loop`) — so every
+   mode injects as one self-contained burst regardless of whether it fires at connection start or
+   mid-conversation.
 5. **Concurrency contract is explicit and documented in the class docstring** (Section 3.1) rather than enforced
    by a lock — adding a lock here would suggest it's safe to call from a second task, which it is not; the right
    fix for that misuse is at the call site (always drive it from `opus_loop`), not inside this module.
