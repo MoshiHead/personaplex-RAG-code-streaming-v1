@@ -458,10 +458,57 @@ Section 21's benchmark report treats Mode F's two rows as a *paired comparison* 
 setup/completion pair -- it prints arm 1's and arm 2's `injection_latency_s` side by side and
 computes the ratio between them directly (`reset_and_replay costs Nx as much as the burst`).
 
-**Not yet run against the real model** -- next step is the same pattern as B/C/D/E: run Section
-20's new Run 6 cell on the RunPod pod. The expected result, given Mode C's own earlier benchmark
-(~25ms/injected token plus the full persona/voice prompt forcing cost), is that arm 2 costs
-noticeably more than arm 1 -- arm 2 pays for everything arm 1 pays for, plus a full prompt replay.
-The interesting number is *how much* more, since that's the concrete, quantified answer to "why
-does this project's live-injection mechanism matter at all" that Modes A-E's qualitative
-grounding/derailment findings didn't directly measure.
+## 12. Mode F real run: bug found and fixed (double-logged arm 2), then a clean, positive result
+
+The first real run on the RTX 5090 pod produced a correct *transcript* (Mode F's final answer
+grounded the cancellation policy at least as well as Mode C's -- see below) but a **logging bug**:
+Section 21's `cache_aware` group showed *two* `cache_aware (naive reset_and_replay baseline...)`
+rows with the same timestamp, identical `retrieval_latency_s`/`injection_latency_s`, differing only
+in that the second one also had `generation_latency_s`/`final_answer` populated.
+
+**Root cause**: `RAGSession.benchmark_reset_and_replay_baseline`/`_async` self-logs immediately
+(by design, the same as Mode D/E's `fire_*_burst` methods -- the whole reset+replay+reinject
+sequence is one complete unit of work, there's no separate bounded phase to defer for). But
+`moshi/moshi/offline.py`'s Mode F branch assigned arm 2's return value to `rag_record`, the same
+variable name step 12b's generic `finalize_and_log(rag_record, generation_latency_s=...,
+final_answer=...)` call always finalizes for *every* mode. For Mode C/B and Modes D/E's setup
+calls, `rag_record` is genuinely unfinalized at that point, so this is correct exactly once. For
+Mode F, arm 2 had already logged itself -- the generic call logged it a *second* time with the
+generation fields bolted on. `moshi/moshi/server.py` had the identical bug at its own unconditional
+`finalize_and_log(rag_record)` call after the injection-mode branch.
+
+**Fix**: both files now special-case `InjectionMode.CACHE_AWARE` to skip the generic
+finalize-and-log step entirely (both arms are already fully logged inside the Mode F branch
+itself -- there is no single record left to enrich without double-logging one of the arms). This
+is a `moshi.offline`/`moshi.server` wiring fix only -- `rag/server_integration.py`'s
+`benchmark_reset_and_replay_baseline`/`_async` were correct as designed and needed no change (all
+93 unit tests, unaffected by this fix's scope, still pass).
+
+**The underlying measurement was never wrong** -- only the log had a duplicate row. The real
+result, re-read from the (now non-duplicated) correct rows:
+
+- **Mode F's transcript grounds correctly**: *"...If you cancel more than 24 hours before pickup,
+  we give a full refund. If it's within 24, there's a 50% fee. And if you no show, we keep the
+  full fee."* -- arguably cleaner than Mode C's own recitation (Section 3d's no-show/deposit
+  clause confusion doesn't appear here). This confirms arm 2's reinjection left the same kind of
+  grounded state live going into the rest of the call, as designed.
+- **Arm 1 (cache-aware burst)**: `injection_latency_s = 8.613s` (340 tokens, same as Mode C's own
+  benchmark).
+- **Arm 2 (reset_and_replay baseline)**: `injection_latency_s = 12.841s` for the *same* 340-token
+  reinjection, plus a full persona/voice prompt replay. Retrieval was effectively free the second
+  time (`0.004s` vs. arm 1's `6.8s`) since the same embedding model/index was already warm in
+  memory -- a real, expected effect, not a bug.
+- **Result: reset_and_replay costs 1.49x as much as the cache-preserving burst** for this
+  particular setup. That ratio is smaller than it might intuitively seem because the 340-token
+  knowledge injection (paid by *both* arms identically) dominates the total cost -- the persona/
+  voice prompt replay that arm 2 pays *on top* of that is comparatively short (~4.2s). The 1.49x
+  figure is therefore a conservative, knowledge-block-size-dependent number: a setup injecting a
+  smaller knowledge block (where the replay overhead is a bigger fraction of the total) would show
+  a more dramatic ratio. This is the quantified answer to "why does preserving the live cache
+  matter" that the qualitative A-E findings didn't directly measure.
+
+All six modes (A-F) are now implemented and have real-run results. Project status: Mode C is the
+only mechanism that reliably grounds; B is a confirmed negative control; D and E are concluded
+negative results that sharpened the central finding to "injection timing relative to generation,
+not format, is what mid-call injection actually needs to solve"; F quantifies the concrete cost of
+not having a live-injection mechanism at all.

@@ -444,19 +444,26 @@ class ServerState:
                         f"injection_latency_s={rag_record.get('injection_latency_s')} "
                         f"(vs. arm 1's {cache_aware_record.get('injection_latency_s')})",
                     )
-                # No bounded "generation phase" to time here -- the live duplex conversation just
-                # keeps going after this point -- so finalize immediately with neither
-                # generation_latency_s nor final_answer (both correctly stay None in the log).
-                # Contrast with moshi.offline, which times its bounded generation loop and passes
-                # both in. See RAGSession.finalize_and_log's docstring.
-                rag_record = self.rag_session.finalize_and_log(rag_record)
-                clog.log(
-                    "info",
-                    f"[rag] strategy={rag_record['injection_strategy']!r} "
-                    f"contexts={len(rag_record['retrieved_contexts'])} "
-                    f"injected_tokens={rag_record['injected_token_count']} "
-                    f"injection_latency_s={rag_record.get('injection_latency_s')}",
-                )
+                if self.rag_injection_mode is InjectionMode.CACHE_AWARE:
+                    # Mode F already fully logged both arms above -- arm 1 via an explicit
+                    # finalize_and_log() call, arm 2 via its own self-logging
+                    # (benchmark_reset_and_replay_baseline_async). `rag_record` here is arm 2's
+                    # already-logged dict; finalizing it again below would write a duplicate row.
+                    pass
+                else:
+                    # No bounded "generation phase" to time here -- the live duplex conversation
+                    # just keeps going after this point -- so finalize immediately with neither
+                    # generation_latency_s nor final_answer (both correctly stay None in the log).
+                    # Contrast with moshi.offline, which times its bounded generation loop and
+                    # passes both in. See RAGSession.finalize_and_log's docstring.
+                    rag_record = self.rag_session.finalize_and_log(rag_record)
+                    clog.log(
+                        "info",
+                        f"[rag] strategy={rag_record['injection_strategy']!r} "
+                        f"contexts={len(rag_record['retrieved_contexts'])} "
+                        f"injected_tokens={rag_record['injected_token_count']} "
+                        f"injection_latency_s={rag_record.get('injection_latency_s')}",
+                    )
 
             # Send the handshake.
             if await is_alive():

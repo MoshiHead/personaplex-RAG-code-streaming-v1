@@ -505,14 +505,24 @@ def run_inference(
     if rag_enable:
         generation_latency_s = time.monotonic() - generation_start
         final_answer = "".join(generated_text_tokens)
-        rag_record = rag_session.finalize_and_log(
-            rag_record, generation_latency_s=generation_latency_s, final_answer=final_answer
-        )
-        log(
-            "info",
-            f"[rag] generation_latency_s={generation_latency_s:.3f} "
-            f"total_latency_s={rag_record.get('total_latency_s'):.3f}",
-        )
+        if injection_mode is InjectionMode.CACHE_AWARE:
+            # Mode F already fully logged both arms inside the branch above -- arm 1 via an
+            # explicit finalize_and_log() call (no generation args), arm 2 via its own
+            # self-logging (RAGSession.benchmark_reset_and_replay_baseline). `rag_record` here is
+            # arm 2's already-logged dict; calling finalize_and_log on it again would write a
+            # second, near-duplicate row for arm 2 with generation_latency_s/final_answer bolted
+            # on. There's no single record left to enrich without double-logging one of the arms.
+            log("info", f"[rag] generation_latency_s={generation_latency_s:.3f} "
+                        "(not attached to a cache_aware log row -- see arm 1/arm 2 rows above)")
+        else:
+            rag_record = rag_session.finalize_and_log(
+                rag_record, generation_latency_s=generation_latency_s, final_answer=final_answer
+            )
+            log(
+                "info",
+                f"[rag] generation_latency_s={generation_latency_s:.3f} "
+                f"total_latency_s={rag_record.get('total_latency_s'):.3f}",
+            )
 
 
 def main():
