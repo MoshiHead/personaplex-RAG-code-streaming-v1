@@ -1,0 +1,52 @@
+[
+  {
+    "doc_id": "fleet-specs",
+    "topic": "fleet",
+    "text": "AeroRentals Pro's fleet has two drone models. The PhoenixDrone X is the standard model: 25-minute flight time per battery, 3km control range, 12-megapixel camera, max payload 200g. The SpectraDrone 9 is the premium model: 38-minute flight time per battery, 7km control range, 4K camera with 3-axis gimbal stabilization, max payload 900g."
+  },
+  {
+    "doc_id": "pricing",
+    "topic": "pricing",
+    "text": "Rental pricing: PhoenixDrone X is $65 for 4 hours or $110 for 8 hours. SpectraDrone 9 is $95 for 4 hours or $160 for 8 hours. Multi-day rentals get a 15% discount on the daily rate starting from the third consecutive day."
+  },
+  {
+    "doc_id": "deposit",
+    "topic": "deposit",
+    "text": "A refundable security deposit is required at pickup: $150 for the PhoenixDrone X and $300 for the SpectraDrone 9. The deposit is returned in full within 3 business days of return, provided the drone has no damage."
+  },
+  {
+    "doc_id": "license-requirements",
+    "topic": "requirements",
+    "text": "Renters must be at least 18 years old and present a valid government-issued photo ID. A drone pilot's license is NOT required for recreational rentals under 250g equivalent use within city limits, but renters flying the SpectraDrone 9 commercially must show a valid FAA Part 107 remote pilot certificate."
+  },
+  {
+    "doc_id": "cancellation-policy",
+    "topic": "policy",
+    "text": "Cancellations made more than 24 hours before the scheduled pickup time receive a full refund. Cancellations made within 24 hours of pickup are charged a 50% cancellation fee. No-shows forfeit the full rental fee but the security deposit is still refunded."
+  },
+  {
+    "doc_id": "damage-insurance",
+    "topic": "policy",
+    "text": "AeroRentals Pro offers optional damage protection for $12/day on the PhoenixDrone X and $20/day on the SpectraDrone 9, which waives up to $500 of accidental damage cost. Without damage protection, the renter is responsible for full repair or replacement cost, deducted from the deposit first and billed separately if costs exceed the deposit."
+  },
+  {
+    "doc_id": "weather-policy",
+    "topic": "policy",
+    "text": "Drones may not be flown in winds exceeding 20mph, in rain, or in temperatures below 0°C. If a rental day is lost to unsafe weather confirmed by the renter and reported within 2 hours of pickup, AeroRentals Pro will reschedule that day at no extra charge."
+  },
+  {
+    "doc_id": "pickup-locations",
+    "topic": "logistics",
+    "text": "AeroRentals Pro has two pickup locations: the Downtown depot (open 8am-7pm daily) and the Airport Annex (open 9am-5pm, closed Sundays). Drones reserved online can be picked up at either location; same-day walk-in rentals are only available at the Downtown depot, subject to availability."
+  },
+  {
+    "doc_id": "late-return",
+    "topic": "policy",
+    "text": "Late returns are charged at $15 per hour past the agreed return time for the PhoenixDrone X and $25 per hour for the SpectraDrone 9, deducted automatically from the security deposit."
+  },
+  {
+    "doc_id": "group-discount",
+    "topic": "pricing",
+    "text": "Groups renting 3 or more drones at once for the same time window receive a 10% discount on the total booking. Corporate accounts renting more than 10 drone-days per month qualify for a dedicated account rate -- contact the business desk for a quote."
+  }
+]

@@ -96,7 +96,10 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False,
+                 rag_enable: bool = False, rag_index: str | None = None,
+                 rag_top_k: int = 5, rag_embedding_model: str = "bge-small",
+                 rag_log_dir: str = "rag_logs"):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -110,11 +113,48 @@ class ServerState:
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
         )
-        
+
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
+
+        # Optional RAG research framework (rag/, a sibling package to moshi/, not a hard
+        # dependency of it). Disabled by default -- self.rag_session stays None and every call
+        # site below checks for that before doing anything, so baseline behavior is unchanged
+        # when --rag-enable is not passed. Constructed once per process (like self.lm_gen above),
+        # not per connection, so the embedding model/FAISS index aren't reloaded on every request.
+        # See docs/STREAMING_AND_INJECTION_DESIGN.md for the full design.
+        self.rag_session = None
+        if rag_enable:
+            if not rag_index:
+                raise ValueError("--rag-enable requires --rag-index (a path produced by `python -m rag.build_index`).")
+            try:
+                from rag.config import InjectionMode, RAGConfig
+                from rag.server_integration import RAGSession
+            except ImportError as exc:
+                raise ImportError(
+                    "rag_enable=True but the `rag` package could not be imported. It lives at the "
+                    "repository root (a sibling of moshi/), not inside the moshi package -- make "
+                    "sure the repository root is on sys.path/PYTHONPATH. "
+                    f"Original error: {exc}"
+                ) from exc
+
+            rag_config = RAGConfig(
+                enable_rag=True,
+                injection_mode=InjectionMode.PERSONA_RAG,
+                top_k=rag_top_k,
+                embedding_model=rag_embedding_model,
+                log_dir=rag_log_dir,
+            )
+            self.rag_session = RAGSession(
+                config=rag_config,
+                lm_gen=self.lm_gen,
+                text_tokenizer=self.text_tokenizer,
+                make_zero_audio_frame=self.lm_gen._encode_zero_frame,
+                make_silence_audio_frame=self.lm_gen._encode_sine_frame,
+                index_path=rag_index,
+            )
     
     def warmup(self):
         for _ in range(4):
@@ -170,6 +210,10 @@ class ServerState:
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
 
+        # Optional per-connection RAG query (Mode C). `.get(...)` rather than `request.query[...]`
+        # so older/unmodified clients that never send this key are unaffected.
+        rag_query = request.query.get("rag_query", "")
+
         async def recv_loop():
             nonlocal close
             try:
@@ -208,6 +252,17 @@ class ServerState:
                 if close:
                     return
                 await asyncio.sleep(0.001)
+
+                # Reserved insertion point for incremental RAG injection (Modes D/E/F -- not yet
+                # populated by any mode in this increment; Mode C injects in one blocking burst
+                # before this loop ever starts, see below). Executes at most one forced
+                # text-token step per tick, BEFORE draining real audio, and is a no-op when there
+                # is no queued job -- see docs/STREAMING_AND_INJECTION_DESIGN.md Section 3.2 for
+                # why this is the only safe place to do this (opus_loop is the sole coroutine that
+                # ever calls self.lm_gen.step()).
+                if self.rag_session is not None:
+                    self.rag_session.consume_one_tick()
+
                 pcm = opus_reader.read_pcm()
                 if pcm.shape[-1] == 0:
                     continue
@@ -283,6 +338,25 @@ class ServerState:
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
             self.mimi.reset_streaming()
             clog.log("info", "done with system prompts")
+
+            # Optional RAG knowledge injection (Mode C -- persona-compatible). Runs once per
+            # connection, right after the persona/voice prompt and before opus_loop/recv_loop/
+            # send_loop start -- i.e. still inside this `async with self.lock:` block, so there is
+            # no concurrent caller of lm_gen.step() yet. Uses the exact same forced-step
+            # mechanism as the persona prompt above and never calls reset_streaming(), so the
+            # persona/voice conditioning already loaded into the live RingKVCache is preserved,
+            # not replaced. No-op (and zero added latency beyond a None check) when RAG wasn't
+            # enabled at server startup. See docs/STREAMING_AND_INJECTION_DESIGN.md Section 3/4.
+            if self.rag_session is not None and rag_query:
+                rag_record = self.rag_session.inject_persona_compatible_knowledge(rag_query)
+                clog.log(
+                    "info",
+                    f"[rag] strategy={rag_record['injection_strategy']!r} "
+                    f"contexts={len(rag_record['retrieved_contexts'])} "
+                    f"injected_tokens={rag_record['injected_token_count']} "
+                    f"injection_latency_s={rag_record.get('injection_latency_s')}",
+                )
+
             # Send the handshake.
             if await is_alive():
                 await ws.send_bytes(b"\x00")
@@ -391,6 +465,22 @@ def main():
         )
     )
 
+    # RAG knowledge injection (Mode C -- persona-compatible). All optional, off by default; the
+    # server behaves identically to before these flags existed when --rag-enable isn't passed.
+    # See docs/ARCHITECTURE_REPORT.md and docs/STREAMING_AND_INJECTION_DESIGN.md.
+    parser.add_argument(
+        "--rag-enable", action="store_true",
+        help="Enable the RAG research framework (Mode C: persona-compatible injection). "
+             "Requires --rag-index."
+    )
+    parser.add_argument(
+        "--rag-index", type=str,
+        help="Path prefix to a saved index from `python -m rag.build_index`."
+    )
+    parser.add_argument("--rag-top-k", type=int, default=5)
+    parser.add_argument("--rag-embedding-model", type=str, default="bge-small")
+    parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
+
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
@@ -453,6 +543,11 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        rag_enable=args.rag_enable,
+        rag_index=args.rag_index,
+        rag_top_k=args.rag_top_k,
+        rag_embedding_model=args.rag_embedding_model,
+        rag_log_dir=args.rag_log_dir,
     )
     logger.info("warming up the model")
     state.warmup()
