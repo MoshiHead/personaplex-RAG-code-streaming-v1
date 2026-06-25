@@ -112,14 +112,188 @@ class TestRAGSessionModeC(unittest.TestCase):
         # Real LMGen attrs aren't present on FakeLMGen -> kv_cache_status must degrade, not raise.
         self.assertFalse(result["kv_cache_status"]["available"])
 
-    def test_log_record_is_persisted_to_disk(self):
+    def test_inject_does_not_write_to_the_log_until_finalized(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["fact one"], "scores": [0.8]})
         session, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
         session.inject_persona_compatible_knowledge("a question")
 
+        self.assertEqual(session.logger.read_all(), [])
+
+    def test_finalize_and_log_persists_exactly_one_row(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact one"], "scores": [0.8]})
+        session, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.inject_persona_compatible_knowledge("a question")
+        session.finalize_and_log(record)
+
         rows = session.logger.read_all()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["user_query"], "a question")
+
+    def test_finalize_and_log_without_generation_args_leaves_those_fields_none(self):
+        # Mirrors server.py's call site: no bounded generation phase to time.
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact one"], "scores": [0.8]})
+        session, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.inject_persona_compatible_knowledge("a question")
+        finalized = session.finalize_and_log(record)
+
+        self.assertIsNone(finalized["generation_latency_s"])
+        self.assertIsNone(finalized["final_answer"])
+        # total_latency_s should still equal retrieval + injection (generation contributes 0).
+        expected_total = finalized["retrieval_latency_s"] + finalized["injection_latency_s"]
+        self.assertAlmostEqual(finalized["total_latency_s"], expected_total)
+
+    def test_finalize_and_log_with_generation_args_populates_and_sums_latency(self):
+        # Mirrors offline.py's call site: a bounded generation phase was timed.
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact one"], "scores": [0.8]})
+        session, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.inject_persona_compatible_knowledge("a question")
+        finalized = session.finalize_and_log(
+            record, generation_latency_s=2.5, final_answer="Hello there."
+        )
+
+        self.assertEqual(finalized["generation_latency_s"], 2.5)
+        self.assertEqual(finalized["final_answer"], "Hello there.")
+        expected_total = (
+            finalized["retrieval_latency_s"] + finalized["injection_latency_s"] + 2.5
+        )
+        self.assertAlmostEqual(finalized["total_latency_s"], expected_total)
+
+        rows = session.logger.read_all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["final_answer"], "Hello there.")
+
+    def test_finalize_and_log_works_for_skipped_records_too(self):
+        # The "skipped" early-return paths from inject_persona_compatible_knowledge must also be
+        # finalize-able (e.g. offline.py always calls finalize_and_log regardless of outcome).
+        config = RAGConfig(enable_rag=False, log_dir=self.tmp_dir)
+        session, _ = _make_session(config, self.tmp_dir, retriever=FakeRetriever({"query": "q", "contexts": [], "scores": []}))
+        record = session.inject_persona_compatible_knowledge("a question")
+        finalized = session.finalize_and_log(record, generation_latency_s=1.0, final_answer="hi")
+
+        self.assertIn("skipped", finalized["injection_strategy"])
+        self.assertEqual(finalized["generation_latency_s"], 1.0)
+        self.assertEqual(session.logger.read_all()[0]["final_answer"], "hi")
+
+
+class TestRAGSessionModeB(unittest.TestCase):
+    """Mode B: the naive 'Relevant Knowledge: ... User Question: ...' negative control."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.PROMPT_RAG, log_dir=self.tmp_dir
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_disabled_rag_skips_injection(self):
+        config = RAGConfig(enable_rag=False, log_dir=self.tmp_dir)
+        retriever = FakeRetriever({"query": "q", "contexts": [], "scores": []})
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
+
+        result = session.inject_standard_prompt_rag("What is the deposit?")
+
+        self.assertIn("skipped", result["injection_strategy"])
+        self.assertEqual(len(lm_gen.calls), 0)
+
+    def test_empty_retrieval_result_skips_injection(self):
+        retriever = FakeRetriever({"query": "q", "contexts": [], "scores": []})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        result = session.inject_standard_prompt_rag("What is the deposit?")
+        self.assertIn("skipped (no contexts", result["injection_strategy"])
+        self.assertEqual(len(lm_gen.calls), 0)
+
+    def test_injected_text_matches_the_naive_template_exactly(self):
+        retriever = FakeRetriever(
+            {"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.92]}
+        )
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        session.inject_standard_prompt_rag("How much is the deposit?")
+
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        expected = (
+            "Relevant Knowledge:\nA $300 deposit is required.\n\n"
+            "User Question:\nHow much is the deposit?\n\n"
+            "Use the knowledge above when answering."
+        )
+        self.assertEqual(forced_text, expected)
+
+    def test_naive_template_is_not_wrapped_in_system_tags(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        session.inject_standard_prompt_rag("a question")
+
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertNotIn("<system>", forced_text)
+
+    def test_never_calls_reset_streaming(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        session.inject_standard_prompt_rag("a question")
+        self.assertFalse(lm_gen.reset_streaming_called)
+
+    def test_logs_with_prompt_rag_mode_label(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.inject_standard_prompt_rag("a question")
+        session.finalize_and_log(record)
+
+        rows = session.logger.read_all()
+        self.assertEqual(rows[0]["mode"], "prompt_rag")
+        self.assertIn("negative control", rows[0]["injection_strategy"])
+
+
+class TestModeBAndModeCRetrieveIdentically(unittest.TestCase):
+    """Both connection-start modes must retrieve the same way -- the experiment is only valid if
+    the *only* difference between B and C is the injection template, not the retrieval call."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.config = RAGConfig(enable_rag=True, log_dir=self.tmp_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_both_modes_call_retrieve_context_with_the_same_arguments(self):
+        retriever = FakeRetriever(
+            {"query": "q", "contexts": ["doc one", "doc two"], "scores": [0.9, 0.8]}
+        )
+        session_b, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        session_b.inject_standard_prompt_rag("shared question")
+
+        retriever_c = FakeRetriever(
+            {"query": "q", "contexts": ["doc one", "doc two"], "scores": [0.9, 0.8]}
+        )
+        session_c, _ = _make_session(self.config, self.tmp_dir, retriever=retriever_c)
+        session_c.inject_persona_compatible_knowledge("shared question")
+
+        self.assertEqual(retriever.queries_seen, ["shared question"])
+        self.assertEqual(retriever_c.queries_seen, ["shared question"])
+
+    def test_modes_diverge_only_in_injected_text_not_in_retrieved_content(self):
+        contexts = ["A $300 deposit is required."]
+        retriever_b = FakeRetriever({"query": "q", "contexts": contexts, "scores": [0.9]})
+        retriever_c = FakeRetriever({"query": "q", "contexts": contexts, "scores": [0.9]})
+
+        session_b, lm_gen_b = _make_session(self.config, self.tmp_dir, retriever=retriever_b)
+        session_c, lm_gen_c = _make_session(self.config, self.tmp_dir, retriever=retriever_c)
+
+        record_b = session_b.inject_standard_prompt_rag("How much is the deposit?")
+        record_c = session_c.inject_persona_compatible_knowledge("How much is the deposit?")
+
+        # Same retrieved facts...
+        self.assertEqual(record_b["retrieved_contexts"], record_c["retrieved_contexts"])
+        self.assertEqual(record_b["retrieved_scores"], record_c["retrieved_scores"])
+        # ...but different injected text (different template/wrapping) and therefore, generally,
+        # a different forced-token count.
+        text_b = "".join(chr(c["text_token"]) for c in lm_gen_b.calls)
+        text_c = "".join(chr(c["text_token"]) for c in lm_gen_c.calls)
+        self.assertNotEqual(text_b, text_c)
+        self.assertTrue(text_c.startswith("<system>"))
+        self.assertFalse(text_b.startswith("<system>"))
 
 
 class TestRAGSessionIncrementalQueue(unittest.TestCase):

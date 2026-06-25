@@ -138,6 +138,33 @@ only affected this one binary asset.
 start). Updated the notebook's `AERO_QUESTION_WAV` path and the Section 20 markdown accordingly.
 No other binary assets exist under `rag/` today, so this was the only file affected.
 
+## 3d. Padded-WAV re-run: experimental proof obtained, with one fidelity caveat
+
+Full results and analysis are in the conversation record; summary:
+
+- **Baseline** confidently stated *"We don't have a cancellation policy. Just bring it back on
+  time..."* — a clean confabulation caused by the fact being absent from the bare persona prompt.
+- **Mode C** correctly stated both core numeric facts: *">24 hours before pickup → full refund"*
+  and *"within 24 hours → 50% fee"*, matching the KB exactly. This is the proof requested: Mode C
+  measurably changes and improves factual correctness, via the live, never-reset connection.
+- **Caveat**: Mode C's recitation of the third (compound/contrastive) clause inverted the outcome
+  -- it said no-shows lose "the full rental plus the deposit," but the KB says the deposit *is*
+  refunded for no-shows. The two simple threshold facts transferred correctly; the one clause with
+  a "but not X" structure didn't. Likely cause: PersonaPlex is fine-tuned for natural
+  conversation, not extractive recitation, so it paraphrases injected knowledge in its own words --
+  which is reliable for simple facts and failure-prone on compound ones. Worth keeping in mind for
+  any production use of this mechanism; out of scope to fix in this increment.
+
+**Fixed `generation_latency_s`/`final_answer` always being `null`** (flagged as a known gap after
+the first run): `RAGSession.inject_persona_compatible_knowledge` no longer logs immediately --
+it returns an unfinalized record, and the new `RAGSession.finalize_and_log(record,
+generation_latency_s=..., final_answer=...)` writes the single complete JSONL row once the caller
+knows the generation-phase outcome. `offline.py` now times its bounded generation loop and passes
+both fields in; `server.py`'s connection-start call site finalizes immediately with neither (there
+is no bounded "generation phase" in a live duplex conversation -- both fields correctly stay
+`None` there). 55 unit tests now pass (4 new, covering both finalize-immediately and
+finalize-with-generation-data paths, plus that the log stays empty until `finalize_and_log` runs).
+
 ## 4. Recommendation
 
 Per your instruction, **do not proceed to Modes B/D/E/F yet**. Next action is yours: run Sections
@@ -154,3 +181,28 @@ determines what comes next:
   injections), or (b) the model weighing newly-injected text lower than the original persona prompt
   because of recency/position effects in training data — both are real research questions worth a
   dedicated debugging pass before concluding the mechanism doesn't work at all.
+
+## 5. Addendum: Mode B implemented (negative-control complete)
+
+Mode C was confirmed working end-to-end (Section 3d). Per instruction, proceeded to Mode B to
+complete the A/B/C comparison.
+
+**Implementation**: `RAGSession` was refactored to share a `_retrieve_for_injection()` step between
+Mode B and Mode C (same `query`/`top_k`/`score_threshold` call, identical retrieved facts) and a
+shared `_run_injection()` measurement step, so the *only* code-level difference between the two
+modes is the text template handed to `TokenInjector`:
+
+- Mode C wraps the retrieved facts in `<system>...<system>` (same as the persona prompt).
+- Mode B (`RAGSession.inject_standard_prompt_rag`) builds `"Relevant Knowledge:\n<facts>\n\nUser
+  Question:\n<query>\n\nUse the knowledge above when answering."` with no `<system>` wrapping.
+
+Both `moshi/moshi/offline.py` and `moshi/moshi/server.py` gained a `--rag-injection-mode
+{persona_rag,prompt_rag}` flag (default `persona_rag`, so existing notebook cells/commands are
+unaffected) that selects between the two at the same connection-start call site. 8 new unit tests
+cover the naive template's exact format, that it's *not* `<system>`-wrapped, and that Mode B/Mode C
+retrieve identically while diverging only in injected text (63 tests total, all passing).
+
+**Notebook**: Section 20 now runs all three (Mode A baseline, Mode C, Mode B) against the same
+seed/voice/persona/padded-WAV, and Section 21's benchmark report is grouped per mode. Not yet run
+against the real model -- next step is the same as before: run it on the RunPod pod and compare
+Mode B's transcript to Mode C's (Section 3d) and Mode A's (Section 3).

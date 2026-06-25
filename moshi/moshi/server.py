@@ -99,7 +99,7 @@ class ServerState:
                  save_voice_prompt_embeddings: bool = False,
                  rag_enable: bool = False, rag_index: str | None = None,
                  rag_top_k: int = 5, rag_embedding_model: str = "bge-small",
-                 rag_log_dir: str = "rag_logs"):
+                 rag_log_dir: str = "rag_logs", rag_injection_mode: str = "persona_rag"):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -140,9 +140,17 @@ class ServerState:
                     f"Original error: {exc}"
                 ) from exc
 
+            injection_mode = InjectionMode(rag_injection_mode)
+            if injection_mode not in (InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG):
+                raise ValueError(
+                    f"--rag-injection-mode={rag_injection_mode!r} is not supported by the server yet "
+                    "-- only 'persona_rag' (Mode C) and 'prompt_rag' (Mode B) are implemented so far."
+                )
+            self.rag_injection_mode = injection_mode
+
             rag_config = RAGConfig(
                 enable_rag=True,
-                injection_mode=InjectionMode.PERSONA_RAG,
+                injection_mode=injection_mode,
                 top_k=rag_top_k,
                 embedding_model=rag_embedding_model,
                 log_dir=rag_log_dir,
@@ -339,16 +347,28 @@ class ServerState:
             self.mimi.reset_streaming()
             clog.log("info", "done with system prompts")
 
-            # Optional RAG knowledge injection (Mode C -- persona-compatible). Runs once per
-            # connection, right after the persona/voice prompt and before opus_loop/recv_loop/
-            # send_loop start -- i.e. still inside this `async with self.lock:` block, so there is
-            # no concurrent caller of lm_gen.step() yet. Uses the exact same forced-step
-            # mechanism as the persona prompt above and never calls reset_streaming(), so the
-            # persona/voice conditioning already loaded into the live RingKVCache is preserved,
-            # not replaced. No-op (and zero added latency beyond a None check) when RAG wasn't
-            # enabled at server startup. See docs/STREAMING_AND_INJECTION_DESIGN.md Section 3/4.
+            # Optional RAG knowledge injection (Mode C or Mode B -- see self.rag_injection_mode).
+            # Runs once per connection, right after the persona/voice prompt and before
+            # opus_loop/recv_loop/send_loop start -- i.e. still inside this `async with
+            # self.lock:` block, so there is no concurrent caller of lm_gen.step() yet. Uses the
+            # same forced-step mechanism as the persona prompt above and never calls
+            # reset_streaming(), so the persona/voice conditioning already loaded into the live
+            # RingKVCache is preserved, not replaced. No-op (and zero added latency beyond a None
+            # check) when RAG wasn't enabled at server startup. See
+            # docs/STREAMING_AND_INJECTION_DESIGN.md Section 3/4.
             if self.rag_session is not None and rag_query:
-                rag_record = self.rag_session.inject_persona_compatible_knowledge(rag_query)
+                from rag.config import InjectionMode
+
+                if self.rag_injection_mode is InjectionMode.PERSONA_RAG:
+                    rag_record = self.rag_session.inject_persona_compatible_knowledge(rag_query)
+                else:
+                    rag_record = self.rag_session.inject_standard_prompt_rag(rag_query)
+                # No bounded "generation phase" to time here -- the live duplex conversation just
+                # keeps going after this point -- so finalize immediately with neither
+                # generation_latency_s nor final_answer (both correctly stay None in the log).
+                # Contrast with moshi.offline, which times its bounded generation loop and passes
+                # both in. See RAGSession.finalize_and_log's docstring.
+                rag_record = self.rag_session.finalize_and_log(rag_record)
                 clog.log(
                     "info",
                     f"[rag] strategy={rag_record['injection_strategy']!r} "
@@ -480,6 +500,12 @@ def main():
     parser.add_argument("--rag-top-k", type=int, default=5)
     parser.add_argument("--rag-embedding-model", type=str, default="bge-small")
     parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
+    parser.add_argument(
+        "--rag-injection-mode", type=str, default="persona_rag",
+        choices=["persona_rag", "prompt_rag"],
+        help="'persona_rag' = Mode C (same <system> mechanism as the persona prompt). "
+             "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control)."
+    )
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -548,6 +574,7 @@ def main():
         rag_top_k=args.rag_top_k,
         rag_embedding_model=args.rag_embedding_model,
         rag_log_dir=args.rag_log_dir,
+        rag_injection_mode=args.rag_injection_mode,
     )
     logger.info("warming up the model")
     state.warmup()

@@ -42,6 +42,7 @@ keep parity with voice-prompt feeding logic in the server.
 import argparse
 import os
 import tarfile
+import time
 from pathlib import Path
 import json
 from typing import Optional, List
@@ -175,6 +176,7 @@ def run_inference(
     rag_top_k: int = 5,
     rag_embedding_model: str = "bge-small",
     rag_log_dir: str = "rag_logs",
+    rag_injection_mode: str = "persona_rag",
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
@@ -183,10 +185,13 @@ def run_inference(
     - Loads system text tokens and voice prompt
     - Runs prompt phases (text + voice + silences) via LMGen.step_system_prompts
     - If rag_enable: retrieves knowledge for rag_query from a saved rag/ FAISS index and injects
-      it via the same <system>...<system> mechanism as the persona prompt (Mode C), right after
-      the persona/voice prompt and before any user audio is processed -- see
-      docs/STREAMING_AND_INJECTION_DESIGN.md. This is purely additive: rag_enable defaults to
-      False and the rest of this function is unchanged when it is.
+      it right after the persona/voice prompt and before any user audio is processed -- see
+      docs/STREAMING_AND_INJECTION_DESIGN.md. `rag_injection_mode` selects the injection
+      template: "persona_rag" (Mode C -- same <system>...<system> mechanism as the persona
+      prompt) or "prompt_rag" (Mode B -- the naive "Relevant Knowledge: ... User Question: ..."
+      negative control; see docs/ARCHITECTURE_REPORT.md Section 6 for why B is expected to
+      underperform C). This is purely additive: rag_enable defaults to False and the rest of
+      this function is unchanged when it is.
     - Streams the user WAV frames into the input channels and samples model outputs
     - Decodes and writes an output WAV of the same duration
     """
@@ -265,15 +270,16 @@ def run_inference(
     # Reset mimi streaming after voice prompt encoding
     mimi.reset_streaming()
 
-    # 7b) Optional RAG knowledge injection (Mode C -- persona-compatible). Disabled by default
-    #     (rag_enable=False), in which case this block does not run and nothing below changes.
-    #     Lazily imports rag/ (a sibling package to moshi/, not a dependency of it) only when
-    #     actually requested, so `moshi.offline` itself never gains a hard dependency on rag/.
-    #     See docs/STREAMING_AND_INJECTION_DESIGN.md Section 3/4 for why this insertion point
-    #     (after step_system_prompts, before any live audio is processed) is the correct one for
-    #     Mode C specifically: it reuses the exact same forced-step mechanism as the persona
-    #     prompt, never calls reset_streaming(), and -- crucially for offline.py, which has no
-    #     live "user turn" concept at all -- runs once, deterministically, before generation.
+    # 7b) Optional RAG knowledge injection (Mode C or Mode B -- see rag_injection_mode). Disabled
+    #     by default (rag_enable=False), in which case this block does not run and nothing below
+    #     changes. Lazily imports rag/ (a sibling package to moshi/, not a dependency of it) only
+    #     when actually requested, so `moshi.offline` itself never gains a hard dependency on
+    #     rag/. See docs/STREAMING_AND_INJECTION_DESIGN.md Section 3/4 for why this insertion
+    #     point (after step_system_prompts, before any live audio is processed) is the only
+    #     correct one for either of these connection-start-only modes: it reuses the exact same
+    #     forced-step mechanism as the persona prompt, never calls reset_streaming(), and --
+    #     crucially for offline.py, which has no live "user turn" concept at all -- runs once,
+    #     deterministically, before generation.
     if rag_enable:
         if not rag_index:
             raise ValueError("--rag-enable requires --rag-index (a path produced by `python -m rag.build_index`).")
@@ -288,9 +294,16 @@ def run_inference(
                 f"set PYTHONPATH). Original error: {exc}"
             ) from exc
 
+        injection_mode = InjectionMode(rag_injection_mode)
+        if injection_mode not in (InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG):
+            raise ValueError(
+                f"--rag-injection-mode={rag_injection_mode!r} is not supported by moshi.offline yet "
+                "-- only 'persona_rag' (Mode C) and 'prompt_rag' (Mode B) are implemented so far."
+            )
+
         rag_config = RAGConfig(
             enable_rag=True,
-            injection_mode=InjectionMode.PERSONA_RAG,
+            injection_mode=injection_mode,
             top_k=rag_top_k,
             embedding_model=rag_embedding_model,
             log_dir=rag_log_dir,
@@ -303,8 +316,11 @@ def run_inference(
             make_silence_audio_frame=lm_gen._encode_sine_frame,
             index_path=rag_index,
         )
-        log("info", f"[rag] retrieving knowledge for query: {rag_query!r}")
-        rag_record = rag_session.inject_persona_compatible_knowledge(rag_query)
+        log("info", f"[rag] mode={injection_mode.value!r} retrieving knowledge for query: {rag_query!r}")
+        if injection_mode is InjectionMode.PERSONA_RAG:
+            rag_record = rag_session.inject_persona_compatible_knowledge(rag_query)
+        else:
+            rag_record = rag_session.inject_standard_prompt_rag(rag_query)
         log(
             "info",
             f"[rag] strategy={rag_record['injection_strategy']!r} "
@@ -313,6 +329,9 @@ def run_inference(
             f"retrieval_latency_s={rag_record.get('retrieval_latency_s')} "
             f"injection_latency_s={rag_record.get('injection_latency_s')}",
         )
+        # `rag_record` is not written to the log yet -- finalized below (step 12b) once the
+        # generation phase's latency and final transcript are known.
+        generation_start = time.monotonic()
 
     # 8) Load and iterate user audio frames for feeding into the input channels
     sample_rate = mimi.sample_rate
@@ -375,7 +394,20 @@ def run_inference(
     # 12) Write text tokens
     with open(output_text, "w") as file:
         json.dump(generated_text_tokens, file, ensure_ascii=False)
-    log("info", f"Wrote output text to {output_text}")    
+    log("info", f"Wrote output text to {output_text}")
+
+    # 12b) Finalize and write the RAG log row now that the generation phase is done (see step 7b).
+    if rag_enable:
+        generation_latency_s = time.monotonic() - generation_start
+        final_answer = "".join(generated_text_tokens)
+        rag_record = rag_session.finalize_and_log(
+            rag_record, generation_latency_s=generation_latency_s, final_answer=final_answer
+        )
+        log(
+            "info",
+            f"[rag] generation_latency_s={generation_latency_s:.3f} "
+            f"total_latency_s={rag_record.get('total_latency_s'):.3f}",
+        )
 
 
 def main():
@@ -462,6 +494,12 @@ def main():
     parser.add_argument("--rag-top-k", type=int, default=5)
     parser.add_argument("--rag-embedding-model", type=str, default="bge-small")
     parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
+    parser.add_argument(
+        "--rag-injection-mode", type=str, default="persona_rag",
+        choices=["persona_rag", "prompt_rag"],
+        help="'persona_rag' = Mode C (same <system> mechanism as the persona prompt). "
+             "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control)."
+    )
 
     args = parser.parse_args()
 
@@ -514,6 +552,7 @@ def main():
             rag_top_k=args.rag_top_k,
             rag_embedding_model=args.rag_embedding_model,
             rag_log_dir=args.rag_log_dir,
+            rag_injection_mode=args.rag_injection_mode,
         )
 
 

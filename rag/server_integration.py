@@ -60,6 +60,57 @@ class RAGSession:
 
         self.pending_job: Optional[InjectionJob] = None
 
+    # ---- Shared retrieval step for any connection-start mode (B or C) -----------------------
+    def _retrieve_for_injection(self, query: str, mode: str) -> tuple[RequestLogRecord, Optional[dict]]:
+        """Runs retrieval and builds the common prefix of a log record for any connection-start
+        injection mode. Returns `(record, None)` if the caller should stop immediately (RAG
+        disabled, no index, or nothing retrieved above `score_threshold`) -- `record` already
+        explains why via `injection_strategy`. Returns `(record, retrieval_dict)` otherwise, where
+        `retrieval_dict` is `Retriever.retrieve_context`'s `{"query", "contexts", "scores"}`.
+
+        Both Mode B and Mode C retrieve identically -- the *only* thing that should differ between
+        them is how the retrieved text gets formatted before injection. Sharing this step is what
+        guarantees that property rather than relying on two copy-pasted implementations staying in
+        sync by hand.
+        """
+        record = RequestLogRecord(mode=mode, user_query=query)
+
+        if not self.config.enable_rag or self.retriever is None:
+            record.injection_strategy = "skipped (RAG disabled or no index loaded)"
+            return record, None
+
+        t0 = time.monotonic()
+        retrieval = self.retriever.retrieve_context(
+            query, top_k=self.config.top_k, score_threshold=self.config.score_threshold
+        )
+        record.retrieval_latency_s = time.monotonic() - t0
+        record.retrieved_contexts = retrieval["contexts"]
+        record.retrieved_scores = retrieval["scores"]
+
+        if not retrieval["contexts"]:
+            record.injection_strategy = "skipped (no contexts above score_threshold)"
+            return record, None
+
+        return record, retrieval
+
+    def _run_injection(
+        self, record: RequestLogRecord, request: InjectionRequest, strategy_label: str,
+        prompt_text: str, context_text: str,
+    ) -> None:
+        """Shared injection-and-measurement step: pushes `request` through the live model via one
+        blocking `TokenInjector` burst and fills in `record`'s injection-phase fields in place."""
+        t1 = time.monotonic()
+        stats = self.injector.run_to_completion(request)
+        injection_latency_s = time.monotonic() - t1
+
+        record.injection_strategy = strategy_label
+        record.prompt_length_chars = len(prompt_text)
+        record.context_length_chars = len(context_text)
+        record.injected_token_count = stats.token_count
+        record.injection_latency_s = injection_latency_s
+        record.total_latency_s = (record.retrieval_latency_s or 0.0) + injection_latency_s
+        record.kv_cache_status = inspect_kv_cache(self._lm_gen)
+
     # ---- Mode C: connection-start / session-start injection --------------------------------
     def inject_persona_compatible_knowledge(self, query: str) -> dict:
         """Mode C. Retrieves context for `query`, folds it into the *same* `<system>...<system>`
@@ -75,49 +126,107 @@ class RAGSession:
         speech-to-text of the user's audio to retrieve against mid-call -- see the Phase 2
         implementation report for this finding in full).
 
-        Returns the full log record as a dict (also appended to the JSONL log), so the caller can
-        print/inspect it immediately.
+        Returns the record as a dict, **not yet written to the log**. The retrieval/injection
+        phases are the only thing this method can time -- whatever happens next (the live
+        server's open-ended duplex conversation, or `offline.py`'s bounded generation loop) is the
+        caller's to measure. Call `finalize_and_log(record, ...)` exactly once, when the caller
+        knows what (if anything) to add for the generation phase, to actually persist the row.
+        Splitting it this way keeps one JSONL row per logical turn instead of two partial ones.
         """
-        record = RequestLogRecord(mode=InjectionMode.PERSONA_RAG.value, user_query=query)
-
-        if not self.config.enable_rag or self.retriever is None:
-            record.injection_strategy = "skipped (RAG disabled or no index loaded)"
-            self.logger.log(record)
-            return record.to_dict()
-
-        t0 = time.monotonic()
-        retrieval = self.retriever.retrieve_context(
-            query, top_k=self.config.top_k, score_threshold=self.config.score_threshold
-        )
-        retrieval_latency_s = time.monotonic() - t0
-        record.retrieval_latency_s = retrieval_latency_s
-        record.retrieved_contexts = retrieval["contexts"]
-        record.retrieved_scores = retrieval["scores"]
-
-        if not retrieval["contexts"]:
-            record.injection_strategy = "skipped (no contexts above score_threshold)"
-            self.logger.log(record)
+        record, retrieval = self._retrieve_for_injection(query, InjectionMode.PERSONA_RAG.value)
+        if retrieval is None:
             return record.to_dict()
 
         knowledge_block = "\n".join(retrieval["contexts"])
         request = InjectionRequest(
             text=knowledge_block, mode=InjectionMode.PERSONA_RAG.value, wrap_system_tags=True
         )
-
-        t1 = time.monotonic()
-        stats = self.injector.run_to_completion(request)
-        injection_latency_s = time.monotonic() - t1
-
-        record.injection_strategy = "persona_rag (blocking burst, same <system> mechanism as persona prompt)"
-        record.prompt_length_chars = len(wrap_with_system_tags(knowledge_block))
-        record.context_length_chars = len(knowledge_block)
-        record.injected_token_count = stats.token_count
-        record.injection_latency_s = injection_latency_s
-        record.total_latency_s = retrieval_latency_s + injection_latency_s
-        record.kv_cache_status = inspect_kv_cache(self._lm_gen)
-
-        self.logger.log(record)
+        self._run_injection(
+            record, request,
+            strategy_label="persona_rag (blocking burst, same <system> mechanism as persona prompt)",
+            prompt_text=wrap_with_system_tags(knowledge_block),
+            context_text=knowledge_block,
+        )
         return record.to_dict()
+
+    # ---- Mode B: connection-start injection, naive prompt template (negative control) ------
+    def inject_standard_prompt_rag(self, query: str) -> dict:
+        """Mode B -- the deliberate negative-control baseline (see
+        docs/ARCHITECTURE_REPORT.md Section 6). Retrieves context identically to Mode C (same
+        `_retrieve_for_injection` call, same top_k/score_threshold), but formats it as a generic
+        chatbot-style instruction block instead of PersonaPlex's own `<system>...<system>`
+        convention, and does NOT wrap it in `<system>` tags:
+
+            Relevant Knowledge:
+            <retrieved facts>
+
+            User Question:
+            <query>
+
+            Use the knowledge above when answering.
+
+        This is intentionally the "obvious" thing someone might try if they treated PersonaPlex
+        like an ordinary text-prompted chat LLM, without accounting for the fact that it has no
+        prompt string and was never trained on this template's phrasing. Expected (and the point
+        of running this experiment) to retrieve the same facts as Mode C but ground the response
+        less reliably. Same connection-start-only call-site constraint as Mode C applies (no ASR
+        to retrieve against mid-call -- see the Phase 2 implementation report).
+
+        Returns the record as a dict, not yet logged -- call `finalize_and_log(...)`, same as
+        Mode C.
+        """
+        record, retrieval = self._retrieve_for_injection(query, InjectionMode.PROMPT_RAG.value)
+        if retrieval is None:
+            return record.to_dict()
+
+        knowledge_block = "\n".join(retrieval["contexts"])
+        naive_prompt = (
+            f"Relevant Knowledge:\n{knowledge_block}\n\n"
+            f"User Question:\n{query}\n\n"
+            "Use the knowledge above when answering."
+        )
+        request = InjectionRequest(
+            text=naive_prompt, mode=InjectionMode.PROMPT_RAG.value, wrap_system_tags=False
+        )
+        self._run_injection(
+            record, request,
+            strategy_label="prompt_rag (naive 'Relevant Knowledge' block, no <system> wrapping -- negative control)",
+            prompt_text=naive_prompt,
+            context_text=knowledge_block,
+        )
+        return record.to_dict()
+
+    def finalize_and_log(
+        self,
+        record: dict,
+        generation_latency_s: Optional[float] = None,
+        final_answer: Optional[str] = None,
+    ) -> dict:
+        """Completes a record returned by `inject_persona_compatible_knowledge` with whatever the
+        caller learned afterward, recomputes `total_latency_s` to include the generation phase,
+        and writes the one complete row to the JSONL log.
+
+        `offline.py` calls this with both `generation_latency_s` (timed around its bounded
+        encode/step/decode loop) and `final_answer` (the joined transcript). `server.py`'s
+        connection-start call site has no equivalent bounded "generation phase" -- the live duplex
+        conversation just keeps going -- so it calls this immediately with neither argument,
+        which leaves those two fields `None` in the log, correctly reflecting that they don't
+        apply there.
+
+        Call this exactly once per record: the log is append-only, so a second call for the same
+        logical turn produces a second, separate row rather than amending the first.
+        """
+        if generation_latency_s is not None:
+            record["generation_latency_s"] = generation_latency_s
+        if final_answer is not None:
+            record["final_answer"] = final_answer
+        record["total_latency_s"] = (
+            (record.get("retrieval_latency_s") or 0.0)
+            + (record.get("injection_latency_s") or 0.0)
+            + (record.get("generation_latency_s") or 0.0)
+        )
+        self.logger.log(RequestLogRecord(**record))
+        return record
 
     # ---- Modes D/E/F: incremental, per-tick consumption from opus_loop ---------------------
     def queue_injection(self, request: InjectionRequest) -> None:
