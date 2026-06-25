@@ -203,6 +203,88 @@ cover the naive template's exact format, that it's *not* `<system>`-wrapped, and
 retrieve identically while diverging only in injected text (63 tests total, all passing).
 
 **Notebook**: Section 20 now runs all three (Mode A baseline, Mode C, Mode B) against the same
-seed/voice/persona/padded-WAV, and Section 21's benchmark report is grouped per mode. Not yet run
-against the real model -- next step is the same as before: run it on the RunPod pod and compare
-Mode B's transcript to Mode C's (Section 3d) and Mode A's (Section 3).
+seed/voice/persona/padded-WAV, and Section 21's benchmark report is grouped per mode.
+
+## 6. A/B/C result: retrieval is not the bottleneck, injection format is
+
+Run on the real RTX 5090 pod. Decoded transcripts (stripped of `PAD`/`EPAD` control tokens):
+
+- **Mode A**: *"...We don't have a cancellation policy. Just bring it back on time..."* (confabulated)
+- **Mode C**: *"...Cancellations made more than 24 hours before pickup get a full refund. If it's
+  within 24 hours, there's a 50% fee. And no shows lose the full rental plus the deposit..."*
+  (correct on the two core numeric facts; the no-show clause is still subtly wrong, per Section 3d)
+- **Mode B**: *"...Sure, I can help with that. Just to confirm, your reservation is for
+  tomorrow?"* (never states the policy at all)
+
+The benchmark log confirms Mode B and Mode C retrieved **identically** -- same 5
+`retrieved_contexts`, same scores to the decimal (the shared `_retrieve_for_injection()` refactor
+is doing its job: this is a controlled comparison, retrieval is not the variable). The only
+difference was the injection template, and the result is unambiguous: Mode B doesn't just answer
+incorrectly, it doesn't engage with the retrieved facts at all, defaulting to a generic
+clarifying question instead -- a worse outcome than even Mode A's wrong-but-attempted answer.
+
+Two secondary observations:
+- Mode B also took noticeably longer to start speaking (a much longer leading silence than A/C),
+  suggesting the out-of-distribution prompt structure disrupts conversational *timing*, not just
+  content.
+- Per-token injection cost was consistent across modes (~25.3ms/token for both 340 and 371
+  injected tokens), a good sanity check that the latency measurement methodology is sound and
+  that this cost is architectural, not content-dependent.
+
+**This is the headline finding of the project so far**: with retrieval held constant and proven
+identical, injection-format compatibility with PersonaPlex's own training distribution -- not
+retrieval quality -- is what determines whether retrieved knowledge actually gets used. This
+directly confirms the hypothesis from `docs/ARCHITECTURE_REPORT.md` Section 6 and is the strongest
+evidence yet for prioritizing persona-compatible injection (and its incremental/cache-aware
+variants, Modes D/E/F) over naive prompt-template approaches in any further work.
+
+## 7. Mode D implemented (turn-boundary-triggered incremental injection)
+
+**Design** (per the ASR-gap reframing from Section 2): Mode D does not retrieve a fresh query per
+turn -- there is no transcript of what the user said to retrieve against. Instead,
+`RAGSession.prepare_turn_injection_knowledge(query)` retrieves **once**, at connection start, using
+a new, deliberately small `RAGConfig.turn_injection_top_k` (default 2, vs. `top_k`'s default 5) --
+Mode C's own benchmark showed ~25ms per injected token, so a 5-document/340-token block costs ~8.5s
+per injection, far too slow to repeat every time the user pauses. The resulting short knowledge
+block is held, not injected, until `rag/turn_detector.py`'s `TurnBoundaryDetector` (fed raw PCM via
+the new `RAGSession.observe_user_frame()`) detects a pause, at which point it's queued via the
+existing `queue_injection()`/`consume_one_tick()` incremental mechanism (already built for this
+purpose in the Phase 2 design, now finally exercised by a real mode). `observe_user_frame()`
+deliberately refuses to queue a second injection while one is still draining
+(`self.pending_job is None` check), so a chatty user pausing repeatedly can't stack unbounded
+injections.
+
+Wired into both `moshi/moshi/offline.py` (feeding the *raw* `user_audio` array, sliced in lockstep
+with the existing encode/step loop -- `lm_encode_from_sphn` only exposes already-Mimi-encoded
+tokens, so a separate `frame_idx` counter re-slices the original array independently) and
+`moshi/moshi/server.py` (feeding `opus_loop`'s raw `chunk` before its conversion to a torch
+tensor). New `--rag-injection-mode=turn_injection`, `--rag-vad-enable`,
+`--rag-turn-injection-top-k` flags on both, all additive.
+
+**Real calibration finding**: tested the default `TurnDetectorConfig` against the actual
+synthesized-speech WAV used in the notebook (not just synthetic test tones) and found the original
+~480ms silence-hangover default fired **twice during the spoken question itself** (at 4.08s and
+7.04s, before the question even finished at ~7.42s) -- a natural pause after the comma in "Hi, I
+need to..." was long enough to trigger a premature boundary. Swept hangover values against the
+real file and found 1.2s (15 frames) clears that pause while still firing reliably (once, at 7.76s)
+once the speaker actually stops. Updated `TurnDetectorConfig`'s default from 6 to 15 frames with
+this measurement documented in the code comment. This is exactly the failure mode the "lightweight
+heuristic, not a learned VAD" design choice flagged as a risk -- now empirically confirmed and
+tuned against one real recording, not just asserted.
+
+70 unit tests now pass (7 new, covering: VAD-disabled no-op, pre-preparation no-op, boundary
+queuing, `turn_injection_top_k` actually being used instead of `top_k`, no-stacking while a job
+drains, full incremental drain + completion logging, and re-firing after a previous injection
+finishes).
+
+**Notebook**: Section 20 gained "Run 4 -- Mode D", reusing the same padded WAV (its 10s trailing
+silence is exactly the kind of pause Mode D is designed to react to) and the same
+persona/voice/seed as the other three runs. Section 21's benchmark report now also reports Mode
+D's two distinct log-row types: a `turn_injection` setup row (retrieval only, no tokens forced) and
+one or more `incremental (per-tick, opus_loop)` completion rows (one per turn boundary that
+finished draining).
+
+**Not yet run against the real model** -- next step is the same pattern as B/C: run Section 20's
+new Run 4 cell on the RunPod pod and compare Mode D's transcript to Mode C's. The interesting
+question this time isn't just "does it state the policy correctly" but "does injecting mid-stream,
+while the agent has already started speaking, work as well as injecting before it starts at all."

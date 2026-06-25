@@ -62,6 +62,11 @@ class RAGConfig:
     # Modes D/E specific knobs.
     vad_enabled: bool = False
     dynamic_injection_interval_s: float = 30.0  # only consulted by DYNAMIC_RUNTIME
+    # Mode D re-injects on every detected turn boundary, so its per-injection token count must
+    # stay small relative to `top_k` -- Mode C's own benchmark showed ~25ms/injected token, so a
+    # 5-document block (340 tokens, as used by B/C) costs ~8.5s per injection, far too slow to
+    # repeat every time the user pauses. Deliberately defaults much smaller than `top_k`.
+    turn_injection_top_k: int = 2
 
     # Retrieval-layer knobs (consumed by rag.retriever once implemented).
     score_threshold: float | None = None
@@ -91,6 +96,18 @@ class RAGConfig:
 
         if self.top_k <= 0:
             warnings.append(f"TOP_K should be a positive integer, got {self.top_k}.")
+
+        if self.turn_injection_top_k <= 0:
+            warnings.append(
+                f"turn_injection_top_k should be a positive integer, got {self.turn_injection_top_k}."
+            )
+        if self.injection_mode == InjectionMode.TURN_INJECTION and self.turn_injection_top_k > 3:
+            warnings.append(
+                f"turn_injection_top_k={self.turn_injection_top_k} is large for a per-turn "
+                "re-injection -- Mode C's benchmark measured ~25ms per injected token, so "
+                "5 documents (~340 tokens) cost ~8.5s per injection. Consider keeping this small "
+                "(1-2) so repeated mid-conversation injections don't stall the live audio."
+            )
 
         if self.vector_db not in _KNOWN_VECTOR_DBS:
             warnings.append(

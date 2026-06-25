@@ -21,6 +21,7 @@ from .config import InjectionMode, RAGConfig
 from .injection_manager import InjectionJob, InjectionRequest, TokenInjector, wrap_with_system_tags
 from .logging_utils import RequestLogger, RequestLogRecord, inspect_kv_cache
 from .retriever import Retriever
+from .turn_detector import TurnBoundaryDetector
 
 
 class RAGSession:
@@ -59,6 +60,19 @@ class RAGSession:
             self.retriever.load_index(index_path)
 
         self.pending_job: Optional[InjectionJob] = None
+
+        # Mode D (turn injection) state. `turn_detector` is only constructed when both
+        # TURN_INJECTION is selected and VAD is explicitly enabled (RAGConfig.validate() warns
+        # otherwise) -- with no detector, `observe_user_frame()` below is a guaranteed no-op, so
+        # this never affects any other mode. `_turn_injection_request` holds the knowledge
+        # prepared once by `prepare_turn_injection_knowledge()`, re-injected on every detected
+        # turn boundary -- see that method's docstring for why this is a *prepared, fixed* block
+        # rather than a fresh per-turn retrieval (PersonaPlex has no ASR; there is no new query
+        # text to retrieve against mid-call -- see docs/MODE_C_IMPLEMENTATION_REPORT.md Section 2).
+        self.turn_detector: Optional[TurnBoundaryDetector] = None
+        if config.enable_rag and config.injection_mode == InjectionMode.TURN_INJECTION and config.vad_enabled:
+            self.turn_detector = TurnBoundaryDetector()
+        self._turn_injection_request: Optional[InjectionRequest] = None
 
     # ---- Shared retrieval step for any connection-start mode (B or C) -----------------------
     def _retrieve_for_injection(self, query: str, mode: str) -> tuple[RequestLogRecord, Optional[dict]]:
@@ -195,6 +209,80 @@ class RAGSession:
             context_text=knowledge_block,
         )
         return record.to_dict()
+
+    # ---- Mode D: turn-boundary-triggered incremental injection -----------------------------
+    def prepare_turn_injection_knowledge(self, query: str) -> dict:
+        """Mode D setup. Retrieves context for `query` **once**, using the deliberately small
+        `config.turn_injection_top_k` (not `config.top_k` -- see `RAGConfig.turn_injection_top_k`'s
+        docstring on why per-turn re-injection must stay short), and holds the resulting
+        `<system>...<system>`-wrapped knowledge block ready for repeated incremental injection.
+
+        Unlike Mode C/B, this method does **not** push anything through the model itself -- no
+        tokens are forced here, so `injected_token_count`/`injection_latency_s` stay at their
+        defaults in the returned record. The actual injections happen later, one per detected
+        turn boundary, via `observe_user_frame()` + `consume_one_tick()`.
+
+        Intended call site: same as Mode C/B (right after `step_system_prompts_async` completes,
+        still inside the connection's lock, before opus_loop starts) -- but instead of injecting,
+        this just arms the mechanism. Call `finalize_and_log(record)` on the result the same way
+        as the other modes.
+        """
+        record = RequestLogRecord(mode=InjectionMode.TURN_INJECTION.value, user_query=query)
+
+        if not self.config.enable_rag or self.retriever is None:
+            record.injection_strategy = "skipped (RAG disabled or no index loaded)"
+            return record.to_dict()
+
+        # Deliberately uses turn_injection_top_k, NOT config.top_k -- this is the one retrieval
+        # call for Mode D, sized for repeated mid-conversation re-injection (see
+        # RAGConfig.turn_injection_top_k's docstring), unlike Mode B/C's single larger retrieval.
+        t0 = time.monotonic()
+        retrieval = self.retriever.retrieve_context(
+            query, top_k=self.config.turn_injection_top_k, score_threshold=self.config.score_threshold
+        )
+        record.retrieval_latency_s = time.monotonic() - t0
+        record.retrieved_contexts = retrieval["contexts"]
+        record.retrieved_scores = retrieval["scores"]
+        if not retrieval["contexts"]:
+            record.injection_strategy = "skipped (no contexts above score_threshold at turn_injection_top_k)"
+            return record.to_dict()
+
+        knowledge_block = "\n".join(retrieval["contexts"])
+        self._turn_injection_request = InjectionRequest(
+            text=knowledge_block, mode=InjectionMode.TURN_INJECTION.value, wrap_system_tags=True
+        )
+        record.injection_strategy = (
+            "turn_injection (prepared; injected incrementally on each detected turn boundary)"
+        )
+        record.context_length_chars = len(knowledge_block)
+        record.prompt_length_chars = len(wrap_with_system_tags(knowledge_block))
+        return record.to_dict()
+
+    def observe_user_frame(self, pcm_frame) -> bool:
+        """Feed one frame of raw user-audio PCM to the turn-boundary detector. No-op (returns
+        False) unless Mode D is active with VAD enabled and `prepare_turn_injection_knowledge()`
+        has already armed a knowledge block -- safe to call unconditionally every frame in any
+        mode.
+
+        On a detected boundary, queues the prepared turn-injection knowledge for incremental
+        consumption via `consume_one_tick()`, UNLESS a previous injection is still draining
+        (checked via `self.pending_job`) -- this deliberately avoids stacking a second injection
+        on top of one that hasn't finished, which would otherwise grow unboundedly if the user
+        pauses more often than a single injection takes to drain.
+
+        Must be called from the same coroutine that owns `lm_gen.step()` for this connection (the
+        same constraint as everything else in this class) -- in the reference server, that's
+        `opus_loop`, right where it already slices each raw PCM frame off the incoming buffer; in
+        `offline.py`, the equivalent point in its single encode/step loop.
+        """
+        if self.turn_detector is None or self._turn_injection_request is None:
+            return False
+
+        boundary = self.turn_detector.push_frame(pcm_frame)
+        if boundary and self.pending_job is None:
+            self.queue_injection(self._turn_injection_request)
+            return True
+        return False
 
     def finalize_and_log(
         self,

@@ -177,6 +177,8 @@ def run_inference(
     rag_embedding_model: str = "bge-small",
     rag_log_dir: str = "rag_logs",
     rag_injection_mode: str = "persona_rag",
+    rag_vad_enable: bool = False,
+    rag_turn_injection_top_k: int = 2,
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
@@ -186,12 +188,15 @@ def run_inference(
     - Runs prompt phases (text + voice + silences) via LMGen.step_system_prompts
     - If rag_enable: retrieves knowledge for rag_query from a saved rag/ FAISS index and injects
       it right after the persona/voice prompt and before any user audio is processed -- see
-      docs/STREAMING_AND_INJECTION_DESIGN.md. `rag_injection_mode` selects the injection
-      template: "persona_rag" (Mode C -- same <system>...<system> mechanism as the persona
-      prompt) or "prompt_rag" (Mode B -- the naive "Relevant Knowledge: ... User Question: ..."
-      negative control; see docs/ARCHITECTURE_REPORT.md Section 6 for why B is expected to
-      underperform C). This is purely additive: rag_enable defaults to False and the rest of
-      this function is unchanged when it is.
+      docs/STREAMING_AND_INJECTION_DESIGN.md. `rag_injection_mode` selects the strategy:
+      "persona_rag" (Mode C -- same <system>...<system> mechanism as the persona prompt),
+      "prompt_rag" (Mode B -- the naive "Relevant Knowledge: ... User Question: ..." negative
+      control; see docs/ARCHITECTURE_REPORT.md Section 6 for why B is expected to underperform
+      C), or "turn_injection" (Mode D -- nothing is injected up front; instead a small knowledge
+      block is prepared and re-injected incrementally every time `rag_vad_enable`'s turn-boundary
+      detector notices a pause in the input WAV's own audio, simulating a live mid-conversation
+      injection without needing a real microphone). This is purely additive: rag_enable defaults
+      to False and the rest of this function is unchanged when it is.
     - Streams the user WAV frames into the input channels and samples model outputs
     - Decodes and writes an output WAV of the same duration
     """
@@ -295,11 +300,14 @@ def run_inference(
             ) from exc
 
         injection_mode = InjectionMode(rag_injection_mode)
-        if injection_mode not in (InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG):
+        if injection_mode not in (InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG, InjectionMode.TURN_INJECTION):
             raise ValueError(
                 f"--rag-injection-mode={rag_injection_mode!r} is not supported by moshi.offline yet "
-                "-- only 'persona_rag' (Mode C) and 'prompt_rag' (Mode B) are implemented so far."
+                "-- only 'persona_rag' (Mode C), 'prompt_rag' (Mode B), and 'turn_injection' "
+                "(Mode D) are implemented so far."
             )
+        if injection_mode is InjectionMode.TURN_INJECTION and not rag_vad_enable:
+            raise ValueError("--rag-injection-mode=turn_injection requires --rag-vad-enable.")
 
         rag_config = RAGConfig(
             enable_rag=True,
@@ -307,6 +315,8 @@ def run_inference(
             top_k=rag_top_k,
             embedding_model=rag_embedding_model,
             log_dir=rag_log_dir,
+            vad_enabled=rag_vad_enable,
+            turn_injection_top_k=rag_turn_injection_top_k,
         )
         rag_session = RAGSession(
             config=rag_config,
@@ -319,8 +329,13 @@ def run_inference(
         log("info", f"[rag] mode={injection_mode.value!r} retrieving knowledge for query: {rag_query!r}")
         if injection_mode is InjectionMode.PERSONA_RAG:
             rag_record = rag_session.inject_persona_compatible_knowledge(rag_query)
-        else:
+        elif injection_mode is InjectionMode.PROMPT_RAG:
             rag_record = rag_session.inject_standard_prompt_rag(rag_query)
+        else:
+            # Mode D: nothing is injected yet -- this only retrieves and arms the knowledge block
+            # that observe_user_frame()/consume_one_tick() will inject incrementally below, once
+            # per detected pause in the input WAV's own audio (step 9).
+            rag_record = rag_session.prepare_turn_injection_knowledge(rag_query)
         log(
             "info",
             f"[rag] strategy={rag_record['injection_strategy']!r} "
@@ -343,6 +358,14 @@ def run_inference(
     generated_text_tokens: List[str] = []
     total_target_samples = user_audio.shape[-1]
 
+    # Tracks which raw audio frame (in `user_audio`) corresponds to the `user_encoded` chunk
+    # currently being processed below -- batching is forced to 1 inside encode_from_sphn, so this
+    # advances exactly once per outer-loop iteration. Used only by Mode D (turn_injection) to feed
+    # the turn-boundary detector the *raw* PCM, which the encode/step pipeline below never exposes
+    # directly (it only ever sees the already-Mimi-encoded tokens). For every other mode (or when
+    # RAG is disabled), `observe_user_frame`/`consume_one_tick` are no-ops -- see RAGSession.
+    frame_idx = 0
+
     for user_encoded in lm_encode_from_sphn(
         mimi,
         lm_iterate_audio(
@@ -350,6 +373,13 @@ def run_inference(
         ),
         max_batch=1,
     ):
+        if rag_enable:
+            frame_start = frame_idx * lm_gen._frame_size
+            raw_frame = user_audio[0, frame_start : frame_start + lm_gen._frame_size]
+            rag_session.observe_user_frame(raw_frame)
+            rag_session.consume_one_tick()
+            frame_idx += 1
+
         # user_encoded: [1, K, T]. Feed one step at a time (usually T==1)
         steps = user_encoded.shape[-1]
         for c in range(steps):
@@ -496,9 +526,21 @@ def main():
     parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
     parser.add_argument(
         "--rag-injection-mode", type=str, default="persona_rag",
-        choices=["persona_rag", "prompt_rag"],
+        choices=["persona_rag", "prompt_rag", "turn_injection"],
         help="'persona_rag' = Mode C (same <system> mechanism as the persona prompt). "
-             "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control)."
+             "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control). "
+             "'turn_injection' = Mode D (re-injects on every detected pause in the input WAV; "
+             "requires --rag-vad-enable)."
+    )
+    parser.add_argument(
+        "--rag-vad-enable", action="store_true",
+        help="Enable the turn-boundary detector (rag/turn_detector.py), required by "
+             "--rag-injection-mode=turn_injection."
+    )
+    parser.add_argument(
+        "--rag-turn-injection-top-k", type=int, default=2,
+        help="Number of documents re-injected per detected turn boundary in Mode D -- "
+             "deliberately small; see RAGConfig.turn_injection_top_k."
     )
 
     args = parser.parse_args()
@@ -553,6 +595,8 @@ def main():
             rag_embedding_model=args.rag_embedding_model,
             rag_log_dir=args.rag_log_dir,
             rag_injection_mode=args.rag_injection_mode,
+            rag_vad_enable=args.rag_vad_enable,
+            rag_turn_injection_top_k=args.rag_turn_injection_top_k,
         )
 
 

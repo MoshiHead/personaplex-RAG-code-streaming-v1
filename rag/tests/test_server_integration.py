@@ -9,6 +9,8 @@ import shutil
 import tempfile
 import unittest
 
+import numpy as np
+
 from rag.config import InjectionMode, RAGConfig
 from rag.injection_manager import InjectionRequest
 from rag.server_integration import RAGSession
@@ -294,6 +296,145 @@ class TestModeBAndModeCRetrieveIdentically(unittest.TestCase):
         self.assertNotEqual(text_b, text_c)
         self.assertTrue(text_c.startswith("<system>"))
         self.assertFalse(text_b.startswith("<system>"))
+
+
+def _speech_frame(n=1920, amplitude=0.5, seed=42):
+    rng = np.random.default_rng(seed)
+    return (rng.standard_normal(n).astype(np.float32)) * amplitude
+
+
+def _silence_frame(n=1920):
+    return np.zeros(n, dtype=np.float32)
+
+
+class TestRAGSessionModeD(unittest.TestCase):
+    """Mode D: turn-boundary-triggered incremental injection. Uses RAGConfig's default
+    TurnDetectorConfig (6-frame silence hangover) via vad_enabled=True."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.config = RAGConfig(
+            enable_rag=True,
+            injection_mode=InjectionMode.TURN_INJECTION,
+            vad_enabled=True,
+            turn_injection_top_k=2,
+            log_dir=self.tmp_dir,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _speak_then_pause(self, session, speech_frames=3, silence_frames=16):
+        # silence_frames must exceed TurnDetectorConfig's default silence_hangover_frames (15,
+        # i.e. ~1.2s) -- see rag/turn_detector.py for why that default is calibrated this high.
+        fired = []
+        for _ in range(speech_frames):
+            fired.append(session.observe_user_frame(_speech_frame()))
+        for _ in range(silence_frames):
+            fired.append(session.observe_user_frame(_silence_frame()))
+        return fired
+
+    def test_vad_disabled_means_no_turn_detector_and_observe_is_a_noop(self):
+        config = RAGConfig(enable_rag=True, injection_mode=InjectionMode.TURN_INJECTION, vad_enabled=False, log_dir=self.tmp_dir)
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
+
+        record = session.prepare_turn_injection_knowledge("a question")
+        session.finalize_and_log(record)
+        self.assertIsNone(session.turn_detector)
+
+        fired = self._speak_then_pause(session)
+        self.assertFalse(any(fired))
+        self.assertEqual(len(lm_gen.calls), 0)
+
+    def test_observe_user_frame_is_a_noop_before_knowledge_is_prepared(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        # Note: prepare_turn_injection_knowledge() was never called.
+        fired = self._speak_then_pause(session)
+        self.assertFalse(any(fired))
+        self.assertEqual(len(lm_gen.calls), 0)
+
+    def test_turn_boundary_queues_injection_after_preparation(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_turn_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        fired = self._speak_then_pause(session)
+        self.assertEqual(sum(fired), 1)
+        self.assertIsNotNone(session.pending_job)
+
+    def test_prepare_uses_turn_injection_top_k_not_top_k(self):
+        seen_top_k = []
+
+        class RecordingRetriever(FakeRetriever):
+            def retrieve_context(self, query, top_k=5, score_threshold=None, metadata_filter=None):
+                seen_top_k.append(top_k)
+                return super().retrieve_context(query, top_k, score_threshold, metadata_filter)
+
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.TURN_INJECTION, vad_enabled=True,
+            top_k=5, turn_injection_top_k=2, log_dir=self.tmp_dir,
+        )
+        retriever = RecordingRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, _ = _make_session(config, self.tmp_dir, retriever=retriever)
+        session.prepare_turn_injection_knowledge("a question")
+
+        self.assertEqual(seen_top_k, [2])
+
+    def test_does_not_stack_a_second_injection_while_one_is_pending(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["a fairly long fact to inject"], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_turn_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        self._speak_then_pause(session)
+        self.assertIsNotNone(session.pending_job)
+        job_before = session.pending_job
+
+        # A second boundary fires while the first injection is still draining (no consume_one_tick
+        # calls in between) -- it must NOT replace/stack on top of the still-pending job.
+        self._speak_then_pause(session)
+        self.assertIs(session.pending_job, job_before)
+
+    def test_full_cycle_drains_via_consume_one_tick_and_logs_completion(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["ab"], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_turn_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        self._speak_then_pause(session)
+        self.assertIsNotNone(session.pending_job)
+
+        while session.pending_job is not None:
+            session.consume_one_tick()
+
+        self.assertGreater(len(lm_gen.calls), 0)
+        self.assertFalse(lm_gen.reset_streaming_called)
+
+        rows = session.logger.read_all()
+        completion_rows = [r for r in rows if r["injection_strategy"] == "incremental (per-tick, opus_loop)"]
+        self.assertEqual(len(completion_rows), 1)
+        self.assertEqual(completion_rows[0]["mode"], "turn_injection")
+
+    def test_can_fire_again_after_the_previous_injection_finishes(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["x"], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_turn_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        self._speak_then_pause(session)
+        while session.pending_job is not None:
+            session.consume_one_tick()
+        first_cycle_calls = len(lm_gen.calls)
+
+        fired_again = self._speak_then_pause(session)
+        self.assertEqual(sum(fired_again), 1)
+        self.assertIsNotNone(session.pending_job)
+        while session.pending_job is not None:
+            session.consume_one_tick()
+        self.assertGreater(len(lm_gen.calls), first_cycle_calls)
 
 
 class TestRAGSessionIncrementalQueue(unittest.TestCase):

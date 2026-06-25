@@ -99,7 +99,8 @@ class ServerState:
                  save_voice_prompt_embeddings: bool = False,
                  rag_enable: bool = False, rag_index: str | None = None,
                  rag_top_k: int = 5, rag_embedding_model: str = "bge-small",
-                 rag_log_dir: str = "rag_logs", rag_injection_mode: str = "persona_rag"):
+                 rag_log_dir: str = "rag_logs", rag_injection_mode: str = "persona_rag",
+                 rag_vad_enable: bool = False, rag_turn_injection_top_k: int = 2):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -141,11 +142,14 @@ class ServerState:
                 ) from exc
 
             injection_mode = InjectionMode(rag_injection_mode)
-            if injection_mode not in (InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG):
+            if injection_mode not in (InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG, InjectionMode.TURN_INJECTION):
                 raise ValueError(
                     f"--rag-injection-mode={rag_injection_mode!r} is not supported by the server yet "
-                    "-- only 'persona_rag' (Mode C) and 'prompt_rag' (Mode B) are implemented so far."
+                    "-- only 'persona_rag' (Mode C), 'prompt_rag' (Mode B), and 'turn_injection' "
+                    "(Mode D) are implemented so far."
                 )
+            if injection_mode is InjectionMode.TURN_INJECTION and not rag_vad_enable:
+                raise ValueError("--rag-injection-mode=turn_injection requires --rag-vad-enable.")
             self.rag_injection_mode = injection_mode
 
             rag_config = RAGConfig(
@@ -154,6 +158,8 @@ class ServerState:
                 top_k=rag_top_k,
                 embedding_model=rag_embedding_model,
                 log_dir=rag_log_dir,
+                vad_enabled=rag_vad_enable,
+                turn_injection_top_k=rag_turn_injection_top_k,
             )
             self.rag_session = RAGSession(
                 config=rag_config,
@@ -261,13 +267,13 @@ class ServerState:
                     return
                 await asyncio.sleep(0.001)
 
-                # Reserved insertion point for incremental RAG injection (Modes D/E/F -- not yet
-                # populated by any mode in this increment; Mode C injects in one blocking burst
-                # before this loop ever starts, see below). Executes at most one forced
+                # Incremental RAG injection point (Modes D/E/F). Executes at most one forced
                 # text-token step per tick, BEFORE draining real audio, and is a no-op when there
                 # is no queued job -- see docs/STREAMING_AND_INJECTION_DESIGN.md Section 3.2 for
                 # why this is the only safe place to do this (opus_loop is the sole coroutine that
-                # ever calls self.lm_gen.step()).
+                # ever calls self.lm_gen.step()). Mode C/B never populate a pending job (they
+                # inject in one blocking burst before this loop starts, see above); Mode D's
+                # pending job is populated below, by observe_user_frame().
                 if self.rag_session is not None:
                     self.rag_session.consume_one_tick()
 
@@ -282,6 +288,11 @@ class ServerState:
                     be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
+                    # Mode D: feed the *raw* user-audio frame to the turn-boundary detector before
+                    # it's converted to a torch tensor below. No-op unless turn_injection + VAD are
+                    # both active (see RAGSession.observe_user_frame).
+                    if self.rag_session is not None:
+                        self.rag_session.observe_user_frame(chunk)
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
@@ -347,8 +358,8 @@ class ServerState:
             self.mimi.reset_streaming()
             clog.log("info", "done with system prompts")
 
-            # Optional RAG knowledge injection (Mode C or Mode B -- see self.rag_injection_mode).
-            # Runs once per connection, right after the persona/voice prompt and before
+            # Optional RAG knowledge injection (Mode B/C/D -- see self.rag_injection_mode). Runs
+            # once per connection, right after the persona/voice prompt and before
             # opus_loop/recv_loop/send_loop start -- i.e. still inside this `async with
             # self.lock:` block, so there is no concurrent caller of lm_gen.step() yet. Uses the
             # same forced-step mechanism as the persona prompt above and never calls
@@ -361,8 +372,14 @@ class ServerState:
 
                 if self.rag_injection_mode is InjectionMode.PERSONA_RAG:
                     rag_record = self.rag_session.inject_persona_compatible_knowledge(rag_query)
-                else:
+                elif self.rag_injection_mode is InjectionMode.PROMPT_RAG:
                     rag_record = self.rag_session.inject_standard_prompt_rag(rag_query)
+                else:
+                    # Mode D: nothing is injected here -- this only retrieves and arms the
+                    # knowledge block that opus_loop's observe_user_frame()/consume_one_tick()
+                    # calls (below) will inject incrementally on each detected turn boundary in
+                    # the live user audio.
+                    rag_record = self.rag_session.prepare_turn_injection_knowledge(rag_query)
                 # No bounded "generation phase" to time here -- the live duplex conversation just
                 # keeps going after this point -- so finalize immediately with neither
                 # generation_latency_s nor final_answer (both correctly stay None in the log).
@@ -502,9 +519,21 @@ def main():
     parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
     parser.add_argument(
         "--rag-injection-mode", type=str, default="persona_rag",
-        choices=["persona_rag", "prompt_rag"],
+        choices=["persona_rag", "prompt_rag", "turn_injection"],
         help="'persona_rag' = Mode C (same <system> mechanism as the persona prompt). "
-             "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control)."
+             "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control). "
+             "'turn_injection' = Mode D (re-injects on every detected end-of-user-turn; requires "
+             "--rag-vad-enable)."
+    )
+    parser.add_argument(
+        "--rag-vad-enable", action="store_true",
+        help="Enable the turn-boundary detector (rag/turn_detector.py), required by "
+             "--rag-injection-mode=turn_injection."
+    )
+    parser.add_argument(
+        "--rag-turn-injection-top-k", type=int, default=2,
+        help="Number of documents re-injected per detected turn boundary in Mode D -- "
+             "deliberately small; see RAGConfig.turn_injection_top_k."
     )
 
     args = parser.parse_args()
@@ -575,6 +604,8 @@ def main():
         rag_embedding_model=args.rag_embedding_model,
         rag_log_dir=args.rag_log_dir,
         rag_injection_mode=args.rag_injection_mode,
+        rag_vad_enable=args.rag_vad_enable,
+        rag_turn_injection_top_k=args.rag_turn_injection_top_k,
     )
     logger.info("warming up the model")
     state.warmup()

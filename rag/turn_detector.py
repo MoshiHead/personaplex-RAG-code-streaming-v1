@@ -26,7 +26,14 @@ class TurnDetectorConfig:
     sample_rate: int = 24000
     frame_size: int = 1920
     energy_threshold: float = 0.01     # RMS amplitude considered "speech present"
-    silence_hangover_frames: int = 6   # ~6 * 80ms = ~480ms of continuous silence => turn boundary
+    # ~15 * 80ms = ~1.2s of continuous silence => turn boundary. Empirically calibrated (not just
+    # guessed) against a real synthesized-speech WAV
+    # (assets/test/aero_rentals_question_cancellation_padded.wav): a shorter hangover (e.g. the
+    # previous default of 6 frames / ~480ms) fired on a natural mid-sentence pause (the comma
+    # after "Hi,") *before* the question even finished, queuing a turn-injection at the wrong
+    # moment. 1.2s clears ordinary intra-sentence pauses while still firing reliably once the
+    # speaker actually stops talking.
+    silence_hangover_frames: int = 15
 
 
 class TurnBoundaryDetector:
