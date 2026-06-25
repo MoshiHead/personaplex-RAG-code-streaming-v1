@@ -374,8 +374,94 @@ Section 18's production-realistic 30s default) so the ~17.4s clip actually exerc
 fixed-interval re-injection. Section 21's benchmark report gained the same two-row-type handling
 for `dynamic_runtime` that Mode D already had.
 
-**Not yet run against the real model** -- next step is the same pattern as B/C/D: run Section 20's
-new Run 5 cell on the RunPod pod and compare Mode E's transcript to Mode D's at the burst point.
-If Mode E stays on-topic where Mode D derailed into a fresh greeting, that confirms the `<system>`
-tag itself (not mid-call injection in general) was the cause -- a finding that would matter for any
-future revisit of Mode D, and for Mode F's design.
+## 10. Mode E real run: confirms the `<system>`-tag hypothesis, but exposes a deeper limitation
+
+Run on the real RTX 5090 pod, same persona/voice/seed/padded-WAV as A-D, `MODE_E_DEMO_INTERVAL_S =
+5.0` (two bursts fired, at ~37.7s and ~52.6s elapsed, 143 tokens each, no `<system>` wrapping).
+
+**The `<system>`-tag hypothesis is confirmed.** Mode E's transcript does **not** re-greet -- it is
+byte-for-byte identical to Mode A's confabulated answer (*"...Oh, I'm sorry. We don't have a
+cancellation policy. Just bring it back on time and the rental is all good."*) except for two
+isolated, harmless `.` tokens appearing in the trailing silence, right around the two burst
+points. No leaked text, no derailment, no re-greet. Removing the `<system>` wrapping eliminated
+the specific failure mode Mode D had.
+
+**But Mode E still does not ground.** The model doesn't acknowledge the injected facts in any way
+-- it produces the *exact same wrong answer* as the unmodified baseline, as if the two 143-token
+bursts (fired squarely in the middle of, and after, its response) had no effect on what it chose
+to say. This is a different failure mode from Mode D's (silent non-engagement vs. visible
+derailment), but it is still a failure to achieve the project's actual goal: grounding a live,
+already-started response in newly injected knowledge.
+
+**This sharpens the project's central finding beyond "format matters" (Section 6) and "`<system>`
+tags are call-start-coded" (Section 8).** Looking at what actually differs between Mode C (grounds
+correctly) and Modes D/E (don't), the deeper variable isn't the `<system>` tag at all -- it's
+*timing relative to generation*:
+
+- **Mode C** injects *before* the model has sampled a single token of its response. The entire
+  response is generated fresh, with the injected facts already part of the context the response is
+  built from.
+- **Modes D and E** inject *after* the model has already started generating (and, per these runs,
+  already committed to its wrong answer -- "Oh, I'm sorry, we don't have a cancellation policy..."
+  is well underway by the time any pause/interval trigger can plausibly fire). Forcing background
+  tokens into an in-flight response doesn't give the model a mechanism to revise what it already
+  decided to say; the `<system>` tag only changed *how* that fixed trajectory got perturbed at the
+  forcing point (derail into a new greeting vs. no visible effect), not *whether* the underlying
+  facts got used.
+
+**Implication for any future revisit of D/E**: faster reaction time (firing within the first
+fraction of a second after the user's question, before the model has sampled enough of a response
+to commit to a wrong answer) is a more promising lever than injection format. Out of scope for this
+increment -- recorded here as the reframed conclusion for both Mode D and Mode E, both of which are
+considered concluded, informative negative results.
+
+## 11. Mode F implemented (cache-aware benchmark: burst vs. naive reset_and_replay)
+
+Per instruction, with D and E concluded, proceeded to Mode F -- not a new injection mechanism, but
+a benchmark of the one mechanism in this project that reliably grounds (Mode C's connection-start
+burst) against the obvious alternative an implementation without it would have to fall back to.
+
+**Design**: two arms, both retrieving and injecting the *same* knowledge for the *same* query, so
+the only variable is the path taken to get there:
+
+- **Arm 1 (`RAGSession.fire_cache_aware_burst`)** -- identical to Mode C: one `<system>`-wrapped
+  burst via `TokenInjector.run_to_completion`, `reset_streaming()` never called. This is what this
+  project's mechanism makes possible.
+- **Arm 2 (`RAGSession.benchmark_reset_and_replay_baseline`/`_async`)** -- simulates an
+  implementation that does *not* have a live-injection mechanism and must, on receiving new
+  knowledge mid-call, call `reset_streaming()` (wiping the RingKVCache) and replay the entire
+  persona/voice prompt setup from scratch (`LMGen.step_system_prompts`/`_async`, supplied by the
+  caller as a closure -- `RAGSession` has no handle on the voice prompt path or persona text)
+  before it can inject anything. The whole reset+replay+reinject sequence is timed as one cost,
+  since that total is the number that answers "what would this cost without this project's
+  mechanism."
+
+Both arms share `_retrieve_for_injection`-equivalent retrieval (using `config.top_k`, same as Mode
+C) and the same `_run_injection`/burst-logging plumbing already proven correct by Modes C-E. Arm 2
+deliberately runs second, after arm 1, so the live cache going into the rest of the run reflects
+arm 2's replay + reinjection -- this is intentional, not an oversight: it means Mode F's run also
+produces a transcript that should ground similarly to Mode C's, in addition to the latency
+numbers, since arm 2 leaves the same knowledge live by the time the main generation loop runs.
+
+Wired into `moshi/moshi/offline.py` (both arms run back-to-back right after `step_system_prompts`,
+the same insertion point as every other connection-start mode) and `moshi/moshi/server.py`'s
+connection-start block (arm 2's replay closure uses `step_system_prompts_async`, matching how the
+server already does its initial persona/voice prompt). No new config fields needed -- Mode F
+reuses `RAGConfig.top_k` like Mode C. 93 unit tests now pass (7 new: arm 1 never calls
+`reset_streaming`, arm 1 returns unfinalized like Mode C, arm 2 calls the replay closure exactly
+once before injecting, arm 2 self-logs immediately (no `finalize_and_log` needed, unlike arm 1),
+both arms retrieve with the same `top_k`, plus async equivalents of the replay-ordering and
+non-starving checks).
+
+**Notebook**: Section 20 gained "Run 6 -- Mode F", same persona/voice/seed/padded-WAV as A-E.
+Section 21's benchmark report treats Mode F's two rows as a *paired comparison* rather than a
+setup/completion pair -- it prints arm 1's and arm 2's `injection_latency_s` side by side and
+computes the ratio between them directly (`reset_and_replay costs Nx as much as the burst`).
+
+**Not yet run against the real model** -- next step is the same pattern as B/C/D/E: run Section
+20's new Run 6 cell on the RunPod pod. The expected result, given Mode C's own earlier benchmark
+(~25ms/injected token plus the full persona/voice prompt forcing cost), is that arm 2 costs
+noticeably more than arm 1 -- arm 2 pays for everything arm 1 pays for, plus a full prompt replay.
+The interesting number is *how much* more, since that's the concrete, quantified answer to "why
+does this project's live-injection mechanism matter at all" that Modes A-E's qualitative
+grounding/derailment findings didn't directly measure.

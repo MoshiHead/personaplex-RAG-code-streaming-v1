@@ -636,6 +636,141 @@ class TestRAGSessionModeEAsyncBurst(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(other_task_ticks, [0, 1, 2, 3, 4])
 
 
+class TestRAGSessionModeF(unittest.TestCase):
+    """Mode F: not a new injection mechanism -- a benchmark of the cache-preserving burst (arm 1,
+    same mechanism as Mode C) against a naive reset_streaming()+replay baseline (arm 2), to
+    quantify the cost of NOT preserving the live RingKVCache. See
+    docs/MODE_C_IMPLEMENTATION_REPORT.md Section 11."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.CACHE_AWARE, log_dir=self.tmp_dir,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_fire_cache_aware_burst_never_calls_reset_streaming(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        result = session.fire_cache_aware_burst("How much is the deposit?")
+
+        self.assertEqual(result["injection_strategy"], "cache_aware (burst, no reset -- preserves the live RingKVCache)")
+        self.assertGreater(len(lm_gen.calls), 0)
+        self.assertFalse(lm_gen.reset_streaming_called)
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertTrue(forced_text.startswith("<system>"))
+
+    def test_fire_cache_aware_burst_does_not_write_to_the_log_until_finalized(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        session.fire_cache_aware_burst("a question")
+        self.assertEqual(session.logger.read_all(), [])
+
+    def test_reset_and_replay_baseline_calls_the_replay_fn_before_injecting(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        call_order = []
+
+        def replay_fn():
+            call_order.append("replay")
+            lm_gen.reset_streaming()
+
+        result = session.benchmark_reset_and_replay_baseline("How much is the deposit?", replay_fn)
+
+        self.assertEqual(call_order, ["replay"])  # replay_fn ran exactly once
+        self.assertTrue(lm_gen.reset_streaming_called)  # this mode is the one place this is allowed
+        self.assertGreater(len(lm_gen.calls), 0)  # injection happened too
+        self.assertEqual(
+            result["injection_strategy"],
+            "cache_aware (naive reset_and_replay baseline -- reset_streaming() + full persona/voice prompt replay + reinjection)",
+        )
+        self.assertIsNotNone(result["injection_latency_s"])
+
+    def test_reset_and_replay_baseline_logs_immediately_unlike_the_burst_arm(self):
+        # Unlike fire_cache_aware_burst (which returns unfinalized, like Mode C), the
+        # reset_and_replay arm self-logs immediately -- there's no separate "generation phase" to
+        # defer for, the replay+reinjection sequence IS the entire measured unit of work.
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        session.benchmark_reset_and_replay_baseline("a question", lm_gen.reset_streaming)
+
+        rows = session.logger.read_all()
+        self.assertEqual(len(rows), 1)
+        self.assertIn("reset_and_replay baseline", rows[0]["injection_strategy"])
+
+    def test_both_arms_retrieve_with_top_k_not_a_special_knob(self):
+        seen_top_k = []
+
+        class RecordingRetriever(FakeRetriever):
+            def retrieve_context(self, query, top_k=5, score_threshold=None, metadata_filter=None):
+                seen_top_k.append(top_k)
+                return super().retrieve_context(query, top_k, score_threshold, metadata_filter)
+
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.CACHE_AWARE, top_k=5, log_dir=self.tmp_dir,
+        )
+        retriever = RecordingRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
+
+        session.fire_cache_aware_burst("a question")
+        session.benchmark_reset_and_replay_baseline("a question", lm_gen.reset_streaming)
+
+        self.assertEqual(seen_top_k, [5, 5])
+
+
+class TestRAGSessionModeFAsyncReplay(unittest.IsolatedAsyncioTestCase):
+    """Async-checkpointed equivalent of arm 2, for moshi.server's step_system_prompts_async."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.CACHE_AWARE, log_dir=self.tmp_dir,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    async def test_async_replay_baseline_awaits_the_replay_fn_before_injecting(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        call_order = []
+
+        async def replay_fn():
+            call_order.append("replay")
+            lm_gen.reset_streaming()
+
+        result = await session.benchmark_reset_and_replay_baseline_async("How much is the deposit?", replay_fn)
+
+        self.assertEqual(call_order, ["replay"])
+        self.assertTrue(lm_gen.reset_streaming_called)
+        self.assertGreater(len(lm_gen.calls), 0)
+        self.assertIn("reset_and_replay baseline", result["injection_strategy"])
+
+    async def test_async_replay_does_not_starve_other_coroutines(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["a somewhat longer fact to inject here"], "scores": [0.9]})
+        session, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        async def replay_fn():
+            await asyncio.sleep(0)
+
+        other_task_ticks = []
+
+        async def other_task():
+            for i in range(5):
+                other_task_ticks.append(i)
+                await asyncio.sleep(0)
+
+        await asyncio.gather(
+            session.benchmark_reset_and_replay_baseline_async("a question", replay_fn), other_task()
+        )
+        self.assertEqual(other_task_ticks, [0, 1, 2, 3, 4])
+
+
 class TestRAGSessionIncrementalQueue(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()

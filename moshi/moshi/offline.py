@@ -196,13 +196,16 @@ def run_inference(
       control; see docs/ARCHITECTURE_REPORT.md Section 6 for why B is expected to underperform
       C), "turn_injection" (Mode D -- nothing is injected up front; instead a small knowledge
       block is prepared and re-fired as a burst every time `rag_vad_enable`'s turn-boundary
-      detector notices a pause in the input WAV's own audio), or "dynamic_runtime" (Mode E --
+      detector notices a pause in the input WAV's own audio), "dynamic_runtime" (Mode E --
       same idea as Mode D, but re-fired on a fixed wall-clock interval
       (`rag_dynamic_injection_interval_s`) regardless of turn boundaries, and deliberately NOT
       wrapped in <system> tags -- see docs/MODE_C_IMPLEMENTATION_REPORT.md Section 8 for why Mode
-      D's <system>-wrapped mid-call burst caused the model to re-greet instead of grounding).
-      This is purely additive: rag_enable defaults to False and the rest of this function is
-      unchanged when it is.
+      D's <system>-wrapped mid-call burst caused the model to re-greet instead of grounding), or
+      "cache_aware" (Mode F -- not a new injection mechanism, a benchmark: fires the same
+      connection-preserving burst as Mode C, then measures a naive baseline that resets the live
+      RingKVCache and replays the whole persona/voice prompt setup before re-injecting, to
+      quantify the cost of not preserving the live cache). This is purely additive: rag_enable
+      defaults to False and the rest of this function is unchanged when it is.
     - Streams the user WAV frames into the input channels and samples model outputs
     - Decodes and writes an output WAV of the same duration
     """
@@ -308,12 +311,12 @@ def run_inference(
         injection_mode = InjectionMode(rag_injection_mode)
         if injection_mode not in (
             InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG, InjectionMode.TURN_INJECTION,
-            InjectionMode.DYNAMIC_RUNTIME,
+            InjectionMode.DYNAMIC_RUNTIME, InjectionMode.CACHE_AWARE,
         ):
             raise ValueError(
                 f"--rag-injection-mode={rag_injection_mode!r} is not supported by moshi.offline yet "
                 "-- only 'persona_rag' (Mode C), 'prompt_rag' (Mode B), 'turn_injection' (Mode D), "
-                "and 'dynamic_runtime' (Mode E) are implemented so far."
+                "'dynamic_runtime' (Mode E), and 'cache_aware' (Mode F) are implemented so far."
             )
         if injection_mode is InjectionMode.TURN_INJECTION and not rag_vad_enable:
             raise ValueError("--rag-injection-mode=turn_injection requires --rag-vad-enable.")
@@ -347,12 +350,44 @@ def run_inference(
             # that observe_user_frame()/fire_turn_injection_burst() will inject as a self-contained
             # burst below, once per detected pause in the input WAV's own audio (step 9).
             rag_record = rag_session.prepare_turn_injection_knowledge(rag_query)
-        else:
+        elif injection_mode is InjectionMode.DYNAMIC_RUNTIME:
             # Mode E: nothing is injected yet either -- this only retrieves and arms the knowledge
             # block that tick_dynamic_injection()/fire_dynamic_injection_burst() will inject as a
             # self-contained burst below, once every rag_dynamic_injection_interval_s seconds,
             # regardless of turn boundaries.
             rag_record = rag_session.prepare_dynamic_injection_knowledge(rag_query)
+        else:
+            # Mode F: not a new injection mechanism -- a benchmark of the same cache-preserving
+            # burst (arm 1) against a naive baseline that resets the live RingKVCache and replays
+            # the entire persona/voice prompt setup before re-injecting the same knowledge (arm
+            # 2), to quantify the cost of NOT preserving the live cache. Arm 2 runs last, so
+            # whatever state exists going into the main loop below reflects arm 2's replay +
+            # reinjection (arm 1's effect on the cache is wiped by arm 2's reset, by design -- see
+            # RAGSession.benchmark_reset_and_replay_baseline's docstring).
+            cache_aware_record = rag_session.fire_cache_aware_burst(rag_query)
+            log(
+                "info",
+                f"[rag] cache_aware arm 1 (burst, no reset): "
+                f"injection_latency_s={cache_aware_record.get('injection_latency_s')}",
+            )
+            rag_session.finalize_and_log(cache_aware_record)
+
+            def _replay_persona_and_voice_prompt():
+                mimi.reset_streaming()
+                other_mimi.reset_streaming()
+                lm_gen.reset_streaming()
+                lm_gen.step_system_prompts(mimi)
+                mimi.reset_streaming()
+
+            rag_record = rag_session.benchmark_reset_and_replay_baseline(
+                rag_query, _replay_persona_and_voice_prompt
+            )
+            log(
+                "info",
+                f"[rag] cache_aware arm 2 (reset_and_replay baseline): "
+                f"injection_latency_s={rag_record.get('injection_latency_s')} "
+                f"(vs. arm 1's {cache_aware_record.get('injection_latency_s')})",
+            )
         log(
             "info",
             f"[rag] strategy={rag_record['injection_strategy']!r} "
@@ -566,13 +601,14 @@ def main():
     parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
     parser.add_argument(
         "--rag-injection-mode", type=str, default="persona_rag",
-        choices=["persona_rag", "prompt_rag", "turn_injection", "dynamic_runtime"],
+        choices=["persona_rag", "prompt_rag", "turn_injection", "dynamic_runtime", "cache_aware"],
         help="'persona_rag' = Mode C (same <system> mechanism as the persona prompt). "
              "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control). "
              "'turn_injection' = Mode D (re-injects on every detected pause in the input WAV; "
              "requires --rag-vad-enable). 'dynamic_runtime' = Mode E (re-injects on a fixed "
              "wall-clock interval regardless of pauses, no <system> wrapping; see "
-             "--rag-dynamic-injection-interval-s)."
+             "--rag-dynamic-injection-interval-s). 'cache_aware' = Mode F (benchmark: the same "
+             "burst as persona_rag vs. a naive reset_streaming()+replay baseline)."
     )
     parser.add_argument(
         "--rag-vad-enable", action="store_true",

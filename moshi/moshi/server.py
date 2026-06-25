@@ -145,12 +145,13 @@ class ServerState:
             injection_mode = InjectionMode(rag_injection_mode)
             if injection_mode not in (
                 InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG, InjectionMode.TURN_INJECTION,
-                InjectionMode.DYNAMIC_RUNTIME,
+                InjectionMode.DYNAMIC_RUNTIME, InjectionMode.CACHE_AWARE,
             ):
                 raise ValueError(
                     f"--rag-injection-mode={rag_injection_mode!r} is not supported by the server yet "
                     "-- only 'persona_rag' (Mode C), 'prompt_rag' (Mode B), 'turn_injection' "
-                    "(Mode D), and 'dynamic_runtime' (Mode E) are implemented so far."
+                    "(Mode D), 'dynamic_runtime' (Mode E), and 'cache_aware' (Mode F) are "
+                    "implemented so far."
                 )
             if injection_mode is InjectionMode.TURN_INJECTION and not rag_vad_enable:
                 raise ValueError("--rag-injection-mode=turn_injection requires --rag-vad-enable.")
@@ -405,12 +406,44 @@ class ServerState:
                     # fire_turn_injection_burst_async() calls (below) will inject as a
                     # self-contained burst on each detected turn boundary in the live user audio.
                     rag_record = self.rag_session.prepare_turn_injection_knowledge(rag_query)
-                else:
+                elif self.rag_injection_mode is InjectionMode.DYNAMIC_RUNTIME:
                     # Mode E: nothing is injected here either -- this only retrieves and arms the
                     # knowledge block that opus_loop's tick_dynamic_injection()/
                     # fire_dynamic_injection_burst_async() calls (below) will inject as a
                     # self-contained burst every rag_dynamic_injection_interval_s seconds.
                     rag_record = self.rag_session.prepare_dynamic_injection_knowledge(rag_query)
+                else:
+                    # Mode F: a benchmark, not a new injection mechanism -- arm 1 fires the same
+                    # cache-preserving burst as Mode C; arm 2 simulates an implementation without
+                    # this project's live-injection mechanism (reset_streaming() + full
+                    # persona/voice prompt replay via step_system_prompts_async + reinjection).
+                    # Arm 2 runs last, so the live state going into opus_loop reflects arm 2's
+                    # replay + reinjection -- arm 1's effect is deliberately wiped by arm 2's
+                    # reset (see RAGSession.benchmark_reset_and_replay_baseline_async's docstring).
+                    cache_aware_record = self.rag_session.fire_cache_aware_burst(rag_query)
+                    self.rag_session.finalize_and_log(cache_aware_record)
+                    clog.log(
+                        "info",
+                        f"[rag] cache_aware arm 1 (burst, no reset): "
+                        f"injection_latency_s={cache_aware_record.get('injection_latency_s')}",
+                    )
+
+                    async def _replay_persona_and_voice_prompt():
+                        self.mimi.reset_streaming()
+                        self.other_mimi.reset_streaming()
+                        self.lm_gen.reset_streaming()
+                        await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+                        self.mimi.reset_streaming()
+
+                    rag_record = await self.rag_session.benchmark_reset_and_replay_baseline_async(
+                        rag_query, _replay_persona_and_voice_prompt
+                    )
+                    clog.log(
+                        "info",
+                        f"[rag] cache_aware arm 2 (reset_and_replay baseline): "
+                        f"injection_latency_s={rag_record.get('injection_latency_s')} "
+                        f"(vs. arm 1's {cache_aware_record.get('injection_latency_s')})",
+                    )
                 # No bounded "generation phase" to time here -- the live duplex conversation just
                 # keeps going after this point -- so finalize immediately with neither
                 # generation_latency_s nor final_answer (both correctly stay None in the log).
@@ -550,13 +583,14 @@ def main():
     parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
     parser.add_argument(
         "--rag-injection-mode", type=str, default="persona_rag",
-        choices=["persona_rag", "prompt_rag", "turn_injection", "dynamic_runtime"],
+        choices=["persona_rag", "prompt_rag", "turn_injection", "dynamic_runtime", "cache_aware"],
         help="'persona_rag' = Mode C (same <system> mechanism as the persona prompt). "
              "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control). "
              "'turn_injection' = Mode D (re-injects on every detected end-of-user-turn; requires "
              "--rag-vad-enable). 'dynamic_runtime' = Mode E (re-injects on a fixed wall-clock "
              "interval regardless of turn boundaries, no <system> wrapping; see "
-             "--rag-dynamic-injection-interval-s)."
+             "--rag-dynamic-injection-interval-s). 'cache_aware' = Mode F (benchmark: the same "
+             "burst as persona_rag vs. a naive reset_streaming()+replay baseline)."
     )
     parser.add_argument(
         "--rag-vad-enable", action="store_true",

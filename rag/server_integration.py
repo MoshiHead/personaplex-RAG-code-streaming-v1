@@ -450,6 +450,110 @@ class RAGSession:
             f"dynamic_runtime (burst, fired on {self.config.dynamic_injection_interval_s}s interval, no <system> wrapping)",
         )
 
+    # ---- Mode F: cache-aware burst vs. a naive reset_and_replay baseline -- a benchmark, not a --
+    # new injection strategy. Modes C/D/E already established the only mechanism this project
+    # found that works for connection-start grounding (the <system>-wrapped burst); Mode F exists
+    # to quantify *why preserving the live RingKVCache matters at all* by measuring what it would
+    # cost an implementation that did NOT have this project's live-injection capability and had to
+    # fall back to the obvious alternative: reset_streaming() (wiping the RingKVCache) and replay
+    # the entire persona/voice prompt setup phase from scratch before it could inject anything.
+    def fire_cache_aware_burst(self, query: str) -> dict:
+        """Mode F, arm 1 (cache-aware). Retrieves context for `query` and injects it via the same
+        connection-preserving burst mechanism as Mode C -- `reset_streaming()` is never called,
+        so whatever is already in the live RingKVCache (persona + voice prompt, and in a real
+        live call, anything said so far) stays intact. This is the arm representing what this
+        project's mechanism makes possible; `benchmark_reset_and_replay_baseline`/`_async` is the
+        naive alternative it's being measured against.
+
+        Returns the record as a dict, not yet logged -- call `finalize_and_log(...)`, same as
+        Mode C/B's connection-start methods.
+        """
+        record, retrieval = self._retrieve_for_injection(query, InjectionMode.CACHE_AWARE.value)
+        if retrieval is None:
+            return record.to_dict()
+
+        knowledge_block = "\n".join(retrieval["contexts"])
+        request = InjectionRequest(
+            text=knowledge_block, mode=InjectionMode.CACHE_AWARE.value, wrap_system_tags=True
+        )
+        self._run_injection(
+            record, request,
+            strategy_label="cache_aware (burst, no reset -- preserves the live RingKVCache)",
+            prompt_text=wrap_with_system_tags(knowledge_block),
+            context_text=knowledge_block,
+        )
+        return record.to_dict()
+
+    def benchmark_reset_and_replay_baseline(self, query: str, replay_persona_and_voice_prompt_fn) -> dict:
+        """Mode F, arm 2 (naive baseline). Retrieves the SAME knowledge as arm 1, but simulates an
+        implementation that lacks this project's live-injection mechanism: it must call
+        `reset_streaming()` (wiping the RingKVCache) and replay the entire persona/voice prompt
+        setup phase from scratch before it can inject anything. `replay_persona_and_voice_prompt_fn`
+        is a zero-argument callable supplied by the caller (`moshi.offline`/`moshi.server`) that
+        performs that replay -- this class has no handle on the voice prompt path or persona text
+        needed to call `LMGen.step_system_prompts` itself, by design (RAGSession otherwise never
+        calls `reset_streaming()`, and this is the one mode where that's the deliberate point of
+        the comparison, not an accident).
+
+        Times the WHOLE reset + replay + re-injection sequence as one cost, because that total --
+        not just the injection step -- is the number that answers "what would this cost without
+        this project's mechanism." For `moshi.offline`; use `_async` for the live server.
+        """
+        record, retrieval = self._retrieve_for_injection(query, InjectionMode.CACHE_AWARE.value)
+        if retrieval is None:
+            return record.to_dict()
+
+        knowledge_block = "\n".join(retrieval["contexts"])
+        request = InjectionRequest(
+            text=knowledge_block, mode=InjectionMode.CACHE_AWARE.value, wrap_system_tags=True
+        )
+
+        t0 = time.monotonic()
+        replay_persona_and_voice_prompt_fn()
+        stats = self.injector.run_to_completion(request)
+        replay_and_injection_latency_s = time.monotonic() - t0
+
+        record.injection_strategy = (
+            "cache_aware (naive reset_and_replay baseline -- reset_streaming() + full "
+            "persona/voice prompt replay + reinjection)"
+        )
+        record.injected_token_count = stats.token_count
+        record.injection_latency_s = replay_and_injection_latency_s
+        record.total_latency_s = (record.retrieval_latency_s or 0.0) + replay_and_injection_latency_s
+        record.kv_cache_status = inspect_kv_cache(self._lm_gen)
+        self.logger.log(record)
+        return record.to_dict()
+
+    async def benchmark_reset_and_replay_baseline_async(self, query: str, replay_persona_and_voice_prompt_fn) -> dict:
+        """Async-checkpointed equivalent of `benchmark_reset_and_replay_baseline`, for
+        `moshi.server`'s connection-start call site. `replay_persona_and_voice_prompt_fn` must be
+        an async callable (it will be awaited) -- the live server replays via
+        `LMGen.step_system_prompts_async`, not the sync `step_system_prompts`."""
+        record, retrieval = self._retrieve_for_injection(query, InjectionMode.CACHE_AWARE.value)
+        if retrieval is None:
+            return record.to_dict()
+
+        knowledge_block = "\n".join(retrieval["contexts"])
+        request = InjectionRequest(
+            text=knowledge_block, mode=InjectionMode.CACHE_AWARE.value, wrap_system_tags=True
+        )
+
+        t0 = time.monotonic()
+        await replay_persona_and_voice_prompt_fn()
+        stats = await self.injector.run_to_completion_async(request)
+        replay_and_injection_latency_s = time.monotonic() - t0
+
+        record.injection_strategy = (
+            "cache_aware (naive reset_and_replay baseline -- reset_streaming() + full "
+            "persona/voice prompt replay + reinjection)"
+        )
+        record.injected_token_count = stats.token_count
+        record.injection_latency_s = replay_and_injection_latency_s
+        record.total_latency_s = (record.retrieval_latency_s or 0.0) + replay_and_injection_latency_s
+        record.kv_cache_status = inspect_kv_cache(self._lm_gen)
+        self.logger.log(record)
+        return record.to_dict()
+
     def finalize_and_log(
         self,
         record: dict,
