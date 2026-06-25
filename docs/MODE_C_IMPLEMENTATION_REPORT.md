@@ -288,3 +288,94 @@ finished draining).
 new Run 4 cell on the RunPod pod and compare Mode D's transcript to Mode C's. The interesting
 question this time isn't just "does it state the policy correctly" but "does injecting mid-stream,
 while the agent has already started speaking, work as well as injecting before it starts at all."
+
+## 8. Mode D real run: corruption bug fixed, but a new failure mode found (concluded, not pursued further)
+
+The incremental design above hit a critical bug on its first real run -- forced text leaked
+verbatim into the spoken transcript (`<system>` tags, raw KB text, a SentencePiece artifact), and
+the injection never finished draining. Full root-cause analysis and the fix (replace per-tick
+interleaving with a self-contained burst -- mechanically identical to Mode C's burst, just
+triggered later, by a detected pause instead of by connection start) are in
+`docs/MODE_D_REDESIGN.md`. `TokenInjector.run_to_completion_async` added for the live server so the
+burst doesn't freeze `recv_loop`/`send_loop` for its ~3-9s duration; `offline.py`/`server.py`
+updated to fire it on a detected boundary instead of queuing for per-tick consumption; 75 unit
+tests passing.
+
+**Re-run on the real RTX 5090 pod confirmed the burst fix works as designed**: no raw `<system>`
+tags or verbatim KB text appeared anywhere in Mode D's transcript this time, for any of the four
+runs. The forced burst tokens are correctly invisible to the transcript (nothing decodes/forwards
+`step()`'s output during the burst, exactly like Mode C/B's connection-start burst), and
+`injected_token_count=149` for the 542-char/2-document block matches the expected ~0.27
+tokens/char ratio seen in Mode B/C -- the right content was forced, not corrupted.
+
+**But a second, distinct problem surfaced once the literal leak was out of the way.** Mode D and
+Mode A are byte-identical up to `"...Oh, I'm sorry. We"` -- strong evidence of the same run
+diverging at exactly the burst point. Right there, instead of continuing its sentence or grounding
+in the injected facts, Mode D's transcript jumps to *"We> Hello, thank you for calling AeroRentals
+Pro. This is Tomaz. How can I help you today?"* -- the model abandons what it was saying and
+re-samples a **fresh greeting**, as if a new call had just started. The injected cancellation/
+weather/pickup facts never appear in any form in the visible response.
+
+**Working hypothesis**: `prepare_turn_injection_knowledge` wraps the burst in `<system>...<system>`
+tags (`wrap_system_tags=True`, [rag/server_integration.py:263](../rag/server_integration.py#L263)) --
+the exact same format `step_system_prompts` uses exactly once, at connection start, before the
+model has ever spoken. That is the only context in which the model ever saw a `<system>` block
+during training/persona setup. Forcing that identical pattern again mid-call is plausibly
+interpreted by the model as "a call is starting" rather than "background knowledge to fold into
+the current sentence" -- which would explain a re-greet specifically, not just generic
+disruption. This reframes Section 6's headline finding: Mode C/B's outcomes don't only depend on
+format vs. no-format, but also on `<system>` tags being used at the one position in the
+conversation where they are actually in-distribution (the very start). Mid-call injection may need
+a different convention entirely (e.g. no wrapping at all, or a different marker the model was
+never trained to associate with call-start).
+
+**Decision (per instruction): record this as a documented limitation and do not pursue a fix
+within Mode D.** Mode D is concluded for this project at: *corruption-free, but does not ground --
+it derails the conversation instead.* This is a real, useful negative result, not a dead end to
+hide -- it sharpens what Modes E/F need to get right (any per-turn or periodic injection scheme
+will need to avoid the same out-of-distribution `<system>`-block-mid-call pattern, or explicitly
+test whether the same derailment occurs with a different wrapping convention).
+
+## 9. Mode E implemented (fixed-interval injection, deliberately without `<system>` wrapping)
+
+**Design**: mechanically identical to Mode D's fix -- a self-contained burst via the same
+`TokenInjector.run_to_completion`/`run_to_completion_async`, never interleaved with the real
+generation loop -- but triggered by a fixed wall-clock interval (`RAGConfig.
+dynamic_injection_interval_s`, default 30s) instead of a detected pause, and with one deliberate
+change: the burst is built as a **plain** knowledge block (`wrap_system_tags=False`, no Mode-B-style
+"Relevant Knowledge:/User Question:" framing either -- there's no specific question to frame against
+a periodic, conversation-state-independent re-fire). This directly tests Section 8's hypothesis:
+was Mode D's re-greet derailment caused specifically by the `<system>...<system>` tag reading as
+"a call is starting," or is mid-call forced injection fragile regardless of format?
+
+`RAGSession.prepare_dynamic_injection_knowledge(query)` retrieves once (using the new
+`RAGConfig.dynamic_injection_top_k`, default 2, same "keep it small" reasoning as
+`turn_injection_top_k`) and starts a wall-clock timer. `RAGSession.tick_dynamic_injection()` --
+called once per real audio frame, a no-op in any other mode -- returns `True` once
+`dynamic_injection_interval_s` has elapsed and resets the timer; like Mode D's `observe_user_frame`,
+it only *detects*, the caller fires `fire_dynamic_injection_burst()`/`_async()` before processing
+that frame any further. The actual burst-fire-and-log body is now shared between Modes D and E via
+a new private `RAGSession._fire_prepared_burst`/`_fire_prepared_burst_async` helper (both modes'
+public methods became one-line wrappers around it -- no behavior change to Mode D, confirmed by the
+existing Mode D tests still passing unmodified).
+
+Wired into both `moshi/moshi/offline.py` (a second `tick_dynamic_injection()` check alongside
+Mode D's `observe_user_frame()` check, both no-ops unless their respective mode is active) and
+`moshi/moshi/server.py`'s `opus_loop` (same pattern, `await`-ed). New `--rag-dynamic-injection-interval-s`/
+`--rag-dynamic-injection-top-k` flags on both, and `dynamic_runtime` added to both files'
+`--rag-injection-mode` choices. 86 unit tests now pass (11 new: tick-before-prepare no-op,
+tick-before-interval no-op, tick-after-interval detects without injecting, `dynamic_injection_top_k`
+actually used instead of `top_k`, burst forces tokens with no `<system>` tag present in the forced
+text, re-firing after a second elapsed interval, plus async-burst equivalents of each).
+
+**Notebook**: Section 20 gained "Run 5 -- Mode E", reusing the same persona/voice/seed/padded-WAV
+as the other four runs, with a short demo-only interval (`MODE_E_DEMO_INTERVAL_S = 5.0`, overriding
+Section 18's production-realistic 30s default) so the ~17.4s clip actually exercises at least one
+fixed-interval re-injection. Section 21's benchmark report gained the same two-row-type handling
+for `dynamic_runtime` that Mode D already had.
+
+**Not yet run against the real model** -- next step is the same pattern as B/C/D: run Section 20's
+new Run 5 cell on the RunPod pod and compare Mode E's transcript to Mode D's at the burst point.
+If Mode E stays on-topic where Mode D derailed into a fresh greeting, that confirms the `<system>`
+tag itself (not mid-call injection in general) was the cause -- a finding that would matter for any
+future revisit of Mode D, and for Mode F's design.

@@ -100,7 +100,8 @@ class ServerState:
                  rag_enable: bool = False, rag_index: str | None = None,
                  rag_top_k: int = 5, rag_embedding_model: str = "bge-small",
                  rag_log_dir: str = "rag_logs", rag_injection_mode: str = "persona_rag",
-                 rag_vad_enable: bool = False, rag_turn_injection_top_k: int = 2):
+                 rag_vad_enable: bool = False, rag_turn_injection_top_k: int = 2,
+                 rag_dynamic_injection_interval_s: float = 30.0, rag_dynamic_injection_top_k: int = 2):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -142,11 +143,14 @@ class ServerState:
                 ) from exc
 
             injection_mode = InjectionMode(rag_injection_mode)
-            if injection_mode not in (InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG, InjectionMode.TURN_INJECTION):
+            if injection_mode not in (
+                InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG, InjectionMode.TURN_INJECTION,
+                InjectionMode.DYNAMIC_RUNTIME,
+            ):
                 raise ValueError(
                     f"--rag-injection-mode={rag_injection_mode!r} is not supported by the server yet "
-                    "-- only 'persona_rag' (Mode C), 'prompt_rag' (Mode B), and 'turn_injection' "
-                    "(Mode D) are implemented so far."
+                    "-- only 'persona_rag' (Mode C), 'prompt_rag' (Mode B), 'turn_injection' "
+                    "(Mode D), and 'dynamic_runtime' (Mode E) are implemented so far."
                 )
             if injection_mode is InjectionMode.TURN_INJECTION and not rag_vad_enable:
                 raise ValueError("--rag-injection-mode=turn_injection requires --rag-vad-enable.")
@@ -160,6 +164,8 @@ class ServerState:
                 log_dir=rag_log_dir,
                 vad_enabled=rag_vad_enable,
                 turn_injection_top_k=rag_turn_injection_top_k,
+                dynamic_injection_interval_s=rag_dynamic_injection_interval_s,
+                dynamic_injection_top_k=rag_dynamic_injection_top_k,
             )
             self.rag_session = RAGSession(
                 config=rag_config,
@@ -300,6 +306,18 @@ class ServerState:
                             f"injected_tokens={turn_record['injected_token_count']} "
                             f"injection_latency_s={turn_record.get('injection_latency_s')}",
                         )
+                    # Mode E: fires on a fixed wall-clock interval regardless of turn boundaries --
+                    # no-op unless dynamic_runtime is active and prepare_dynamic_injection_knowledge()
+                    # has armed a knowledge block. Same self-contained-burst-before-this-frame's-real-
+                    # step contract as Mode D above.
+                    if self.rag_session is not None and self.rag_session.tick_dynamic_injection():
+                        dyn_record = await self.rag_session.fire_dynamic_injection_burst_async()
+                        clog.log(
+                            "info",
+                            f"[rag] dynamic-injection interval elapsed -> fired burst: "
+                            f"injected_tokens={dyn_record['injected_token_count']} "
+                            f"injection_latency_s={dyn_record.get('injection_latency_s')}",
+                        )
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
@@ -381,12 +399,18 @@ class ServerState:
                     rag_record = self.rag_session.inject_persona_compatible_knowledge(rag_query)
                 elif self.rag_injection_mode is InjectionMode.PROMPT_RAG:
                     rag_record = self.rag_session.inject_standard_prompt_rag(rag_query)
-                else:
+                elif self.rag_injection_mode is InjectionMode.TURN_INJECTION:
                     # Mode D: nothing is injected here -- this only retrieves and arms the
                     # knowledge block that opus_loop's observe_user_frame()/
                     # fire_turn_injection_burst_async() calls (below) will inject as a
                     # self-contained burst on each detected turn boundary in the live user audio.
                     rag_record = self.rag_session.prepare_turn_injection_knowledge(rag_query)
+                else:
+                    # Mode E: nothing is injected here either -- this only retrieves and arms the
+                    # knowledge block that opus_loop's tick_dynamic_injection()/
+                    # fire_dynamic_injection_burst_async() calls (below) will inject as a
+                    # self-contained burst every rag_dynamic_injection_interval_s seconds.
+                    rag_record = self.rag_session.prepare_dynamic_injection_knowledge(rag_query)
                 # No bounded "generation phase" to time here -- the live duplex conversation just
                 # keeps going after this point -- so finalize immediately with neither
                 # generation_latency_s nor final_answer (both correctly stay None in the log).
@@ -526,11 +550,13 @@ def main():
     parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
     parser.add_argument(
         "--rag-injection-mode", type=str, default="persona_rag",
-        choices=["persona_rag", "prompt_rag", "turn_injection"],
+        choices=["persona_rag", "prompt_rag", "turn_injection", "dynamic_runtime"],
         help="'persona_rag' = Mode C (same <system> mechanism as the persona prompt). "
              "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control). "
              "'turn_injection' = Mode D (re-injects on every detected end-of-user-turn; requires "
-             "--rag-vad-enable)."
+             "--rag-vad-enable). 'dynamic_runtime' = Mode E (re-injects on a fixed wall-clock "
+             "interval regardless of turn boundaries, no <system> wrapping; see "
+             "--rag-dynamic-injection-interval-s)."
     )
     parser.add_argument(
         "--rag-vad-enable", action="store_true",
@@ -541,6 +567,16 @@ def main():
         "--rag-turn-injection-top-k", type=int, default=2,
         help="Number of documents re-injected per detected turn boundary in Mode D -- "
              "deliberately small; see RAGConfig.turn_injection_top_k."
+    )
+    parser.add_argument(
+        "--rag-dynamic-injection-interval-s", type=float, default=30.0,
+        help="Seconds between fixed-interval re-injections in Mode E; see "
+             "RAGConfig.dynamic_injection_interval_s."
+    )
+    parser.add_argument(
+        "--rag-dynamic-injection-top-k", type=int, default=2,
+        help="Number of documents re-injected per fixed-interval burst in Mode E -- "
+             "deliberately small; see RAGConfig.dynamic_injection_top_k."
     )
 
     args = parser.parse_args()
@@ -613,6 +649,8 @@ def main():
         rag_injection_mode=args.rag_injection_mode,
         rag_vad_enable=args.rag_vad_enable,
         rag_turn_injection_top_k=args.rag_turn_injection_top_k,
+        rag_dynamic_injection_interval_s=args.rag_dynamic_injection_interval_s,
+        rag_dynamic_injection_top_k=args.rag_dynamic_injection_top_k,
     )
     logger.info("warming up the model")
     state.warmup()

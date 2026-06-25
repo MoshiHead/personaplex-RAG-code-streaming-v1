@@ -67,6 +67,11 @@ class RAGConfig:
     # 5-document block (340 tokens, as used by B/C) costs ~8.5s per injection, far too slow to
     # repeat every time the user pauses. Deliberately defaults much smaller than `top_k`.
     turn_injection_top_k: int = 2
+    # Mode E re-injects on a fixed wall-clock interval regardless of conversational state, so the
+    # same per-injection-token-count-must-stay-small reasoning as turn_injection_top_k applies --
+    # kept as a separate knob (rather than reusing turn_injection_top_k) because the two modes
+    # don't have to use the same retrieval breadth, even though both default to 2.
+    dynamic_injection_top_k: int = 2
 
     # Retrieval-layer knobs (consumed by rag.retriever once implemented).
     score_threshold: float | None = None
@@ -127,6 +132,19 @@ class RAGConfig:
                 f"{self.dynamic_injection_interval_s}."
             )
 
+        if self.dynamic_injection_top_k <= 0:
+            warnings.append(
+                f"dynamic_injection_top_k should be a positive integer, got "
+                f"{self.dynamic_injection_top_k}."
+            )
+        if self.injection_mode == InjectionMode.DYNAMIC_RUNTIME and self.dynamic_injection_top_k > 3:
+            warnings.append(
+                f"dynamic_injection_top_k={self.dynamic_injection_top_k} is large for a repeated "
+                "fixed-interval re-injection -- Mode C's benchmark measured ~25ms per injected "
+                "token. Consider keeping this small (1-2) so repeated injections don't stall the "
+                "live audio."
+            )
+
         return warnings
 
     def as_dict(self) -> dict:
@@ -166,5 +184,6 @@ class RAGConfig:
             benchmark_mode=_get("BENCHMARK_MODE", False, bool),
             vad_enabled=_get("VAD_ENABLED", False, bool),
             dynamic_injection_interval_s=_get("DYNAMIC_INJECTION_INTERVAL_S", 30.0, float),
+            dynamic_injection_top_k=_get("DYNAMIC_INJECTION_TOP_K", 2, int),
             log_dir=_get("LOG_DIR", "rag_logs"),
         )

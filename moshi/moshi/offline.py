@@ -179,6 +179,8 @@ def run_inference(
     rag_injection_mode: str = "persona_rag",
     rag_vad_enable: bool = False,
     rag_turn_injection_top_k: int = 2,
+    rag_dynamic_injection_interval_s: float = 30.0,
+    rag_dynamic_injection_top_k: int = 2,
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
@@ -192,11 +194,15 @@ def run_inference(
       "persona_rag" (Mode C -- same <system>...<system> mechanism as the persona prompt),
       "prompt_rag" (Mode B -- the naive "Relevant Knowledge: ... User Question: ..." negative
       control; see docs/ARCHITECTURE_REPORT.md Section 6 for why B is expected to underperform
-      C), or "turn_injection" (Mode D -- nothing is injected up front; instead a small knowledge
-      block is prepared and re-injected incrementally every time `rag_vad_enable`'s turn-boundary
-      detector notices a pause in the input WAV's own audio, simulating a live mid-conversation
-      injection without needing a real microphone). This is purely additive: rag_enable defaults
-      to False and the rest of this function is unchanged when it is.
+      C), "turn_injection" (Mode D -- nothing is injected up front; instead a small knowledge
+      block is prepared and re-fired as a burst every time `rag_vad_enable`'s turn-boundary
+      detector notices a pause in the input WAV's own audio), or "dynamic_runtime" (Mode E --
+      same idea as Mode D, but re-fired on a fixed wall-clock interval
+      (`rag_dynamic_injection_interval_s`) regardless of turn boundaries, and deliberately NOT
+      wrapped in <system> tags -- see docs/MODE_C_IMPLEMENTATION_REPORT.md Section 8 for why Mode
+      D's <system>-wrapped mid-call burst caused the model to re-greet instead of grounding).
+      This is purely additive: rag_enable defaults to False and the rest of this function is
+      unchanged when it is.
     - Streams the user WAV frames into the input channels and samples model outputs
     - Decodes and writes an output WAV of the same duration
     """
@@ -300,11 +306,14 @@ def run_inference(
             ) from exc
 
         injection_mode = InjectionMode(rag_injection_mode)
-        if injection_mode not in (InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG, InjectionMode.TURN_INJECTION):
+        if injection_mode not in (
+            InjectionMode.PERSONA_RAG, InjectionMode.PROMPT_RAG, InjectionMode.TURN_INJECTION,
+            InjectionMode.DYNAMIC_RUNTIME,
+        ):
             raise ValueError(
                 f"--rag-injection-mode={rag_injection_mode!r} is not supported by moshi.offline yet "
-                "-- only 'persona_rag' (Mode C), 'prompt_rag' (Mode B), and 'turn_injection' "
-                "(Mode D) are implemented so far."
+                "-- only 'persona_rag' (Mode C), 'prompt_rag' (Mode B), 'turn_injection' (Mode D), "
+                "and 'dynamic_runtime' (Mode E) are implemented so far."
             )
         if injection_mode is InjectionMode.TURN_INJECTION and not rag_vad_enable:
             raise ValueError("--rag-injection-mode=turn_injection requires --rag-vad-enable.")
@@ -317,6 +326,8 @@ def run_inference(
             log_dir=rag_log_dir,
             vad_enabled=rag_vad_enable,
             turn_injection_top_k=rag_turn_injection_top_k,
+            dynamic_injection_interval_s=rag_dynamic_injection_interval_s,
+            dynamic_injection_top_k=rag_dynamic_injection_top_k,
         )
         rag_session = RAGSession(
             config=rag_config,
@@ -331,11 +342,17 @@ def run_inference(
             rag_record = rag_session.inject_persona_compatible_knowledge(rag_query)
         elif injection_mode is InjectionMode.PROMPT_RAG:
             rag_record = rag_session.inject_standard_prompt_rag(rag_query)
-        else:
+        elif injection_mode is InjectionMode.TURN_INJECTION:
             # Mode D: nothing is injected yet -- this only retrieves and arms the knowledge block
             # that observe_user_frame()/fire_turn_injection_burst() will inject as a self-contained
             # burst below, once per detected pause in the input WAV's own audio (step 9).
             rag_record = rag_session.prepare_turn_injection_knowledge(rag_query)
+        else:
+            # Mode E: nothing is injected yet either -- this only retrieves and arms the knowledge
+            # block that tick_dynamic_injection()/fire_dynamic_injection_burst() will inject as a
+            # self-contained burst below, once every rag_dynamic_injection_interval_s seconds,
+            # regardless of turn boundaries.
+            rag_record = rag_session.prepare_dynamic_injection_knowledge(rag_query)
         log(
             "info",
             f"[rag] strategy={rag_record['injection_strategy']!r} "
@@ -388,6 +405,18 @@ def run_inference(
                     f"[rag] turn boundary detected -> fired burst: "
                     f"injected_tokens={turn_record['injected_token_count']} "
                     f"injection_latency_s={turn_record.get('injection_latency_s')}",
+                )
+            # Mode E: fires on a fixed wall-clock interval regardless of turn boundaries -- a
+            # no-op unless dynamic_runtime is active and prepare_dynamic_injection_knowledge() has
+            # armed a knowledge block, so safe to call unconditionally alongside observe_user_frame
+            # above (see RAGSession.tick_dynamic_injection).
+            if rag_session.tick_dynamic_injection():
+                dyn_record = rag_session.fire_dynamic_injection_burst()
+                log(
+                    "info",
+                    f"[rag] dynamic-injection interval elapsed -> fired burst: "
+                    f"injected_tokens={dyn_record['injected_token_count']} "
+                    f"injection_latency_s={dyn_record.get('injection_latency_s')}",
                 )
             frame_idx += 1
 
@@ -537,11 +566,13 @@ def main():
     parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
     parser.add_argument(
         "--rag-injection-mode", type=str, default="persona_rag",
-        choices=["persona_rag", "prompt_rag", "turn_injection"],
+        choices=["persona_rag", "prompt_rag", "turn_injection", "dynamic_runtime"],
         help="'persona_rag' = Mode C (same <system> mechanism as the persona prompt). "
              "'prompt_rag' = Mode B (naive 'Relevant Knowledge: ...' template, negative control). "
              "'turn_injection' = Mode D (re-injects on every detected pause in the input WAV; "
-             "requires --rag-vad-enable)."
+             "requires --rag-vad-enable). 'dynamic_runtime' = Mode E (re-injects on a fixed "
+             "wall-clock interval regardless of pauses, no <system> wrapping; see "
+             "--rag-dynamic-injection-interval-s)."
     )
     parser.add_argument(
         "--rag-vad-enable", action="store_true",
@@ -552,6 +583,16 @@ def main():
         "--rag-turn-injection-top-k", type=int, default=2,
         help="Number of documents re-injected per detected turn boundary in Mode D -- "
              "deliberately small; see RAGConfig.turn_injection_top_k."
+    )
+    parser.add_argument(
+        "--rag-dynamic-injection-interval-s", type=float, default=30.0,
+        help="Seconds between fixed-interval re-injections in Mode E; see "
+             "RAGConfig.dynamic_injection_interval_s."
+    )
+    parser.add_argument(
+        "--rag-dynamic-injection-top-k", type=int, default=2,
+        help="Number of documents re-injected per fixed-interval burst in Mode E -- "
+             "deliberately small; see RAGConfig.dynamic_injection_top_k."
     )
 
     args = parser.parse_args()
@@ -608,6 +649,8 @@ def main():
             rag_injection_mode=args.rag_injection_mode,
             rag_vad_enable=args.rag_vad_enable,
             rag_turn_injection_top_k=args.rag_turn_injection_top_k,
+            rag_dynamic_injection_interval_s=args.rag_dynamic_injection_interval_s,
+            rag_dynamic_injection_top_k=args.rag_dynamic_injection_top_k,
         )
 
 

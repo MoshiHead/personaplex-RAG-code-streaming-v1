@@ -37,6 +37,22 @@ class TestRAGConfigDefaults(unittest.TestCase):
         warnings = cfg.validate()
         self.assertTrue(any("VECTOR_DB" in w for w in warnings))
 
+    def test_invalid_dynamic_injection_top_k_warns(self):
+        cfg = RAGConfig(dynamic_injection_top_k=0)
+        warnings = cfg.validate()
+        self.assertTrue(any("dynamic_injection_top_k" in w for w in warnings))
+
+    def test_large_dynamic_injection_top_k_warns_only_in_dynamic_runtime_mode(self):
+        cfg_active = RAGConfig(enable_rag=True, injection_mode=InjectionMode.DYNAMIC_RUNTIME, dynamic_injection_top_k=5)
+        self.assertTrue(any("large" in w for w in cfg_active.validate()))
+
+        cfg_inactive = RAGConfig(dynamic_injection_top_k=5)
+        self.assertFalse(any("large" in w for w in cfg_inactive.validate()))
+
+    def test_dynamic_runtime_mode_default_top_k_is_clean(self):
+        cfg = RAGConfig(enable_rag=True, injection_mode=InjectionMode.DYNAMIC_RUNTIME)
+        self.assertEqual(cfg.validate(), [])
+
     def test_as_dict_serializes_enum_to_string(self):
         cfg = RAGConfig(injection_mode=InjectionMode.CACHE_AWARE)
         d = cfg.as_dict()

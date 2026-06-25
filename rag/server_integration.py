@@ -75,6 +75,16 @@ class RAGSession:
         self._turn_injection_request: Optional[InjectionRequest] = None
         self._turn_injection_query: Optional[str] = None
 
+        # Mode E (dynamic/periodic injection) state. Unlike Mode D, this needs no turn-boundary
+        # signal at all -- it re-fires on a fixed wall-clock interval regardless of conversational
+        # state, so `_dynamic_injection_last_fire_time` (set once by
+        # `prepare_dynamic_injection_knowledge`, reset by `tick_dynamic_injection`) is the only
+        # piece of state it needs. See the Mode E section below for why its prepared knowledge is
+        # deliberately NOT wrapped in `<system>...<system>` tags, unlike Mode C/D.
+        self._dynamic_injection_request: Optional[InjectionRequest] = None
+        self._dynamic_injection_query: Optional[str] = None
+        self._dynamic_injection_last_fire_time: Optional[float] = None
+
     # ---- Shared retrieval step for any connection-start mode (B or C) -----------------------
     def _retrieve_for_injection(self, query: str, mode: str) -> tuple[RequestLogRecord, Optional[dict]]:
         """Runs retrieval and builds the common prefix of a log record for any connection-start
@@ -291,26 +301,20 @@ class RAGSession:
             return False
         return self.turn_detector.push_frame(pcm_frame)
 
-    def fire_turn_injection_burst(self) -> dict:
-        """Mode D: fires the prepared turn-injection knowledge as ONE synchronous blocking burst
-        (same underlying mechanism as Mode C's `inject_persona_compatible_knowledge` --
-        `TokenInjector.run_to_completion`), triggered by a detected turn boundary instead of
-        connection start. For `moshi.offline`, which has no event loop to share. For the live
-        server, use `fire_turn_injection_burst_async()` instead so the burst doesn't freeze the
-        whole asyncio event loop.
-
-        Logs and returns the completed record immediately (no `finalize_and_log` step needed --
-        unlike Mode B/C, there is no separate bounded "generation phase" to wait for; the burst
-        itself is the entire unit of work for this call).
-        """
-        record = RequestLogRecord(
-            mode=InjectionMode.TURN_INJECTION.value, user_query=self._turn_injection_query
-        )
+    # ---- Shared burst-fire-and-log step for any mid-conversation mode (D, E, ...) -----------
+    def _fire_prepared_burst(self, request: InjectionRequest, query: Optional[str], strategy_label: str) -> dict:
+        """Forces `request`'s tokens through the live model as ONE synchronous blocking burst
+        and logs a single completed record immediately. No `finalize_and_log` step needed here
+        (unlike Mode B/C's connection-start injection) -- there is no separate bounded "generation
+        phase" to wait for; the burst itself is the entire unit of work for this call. For
+        `moshi.offline`, which has no event loop to share; use `_fire_prepared_burst_async` for
+        the live server."""
+        record = RequestLogRecord(mode=request.mode, user_query=query)
         t0 = time.monotonic()
-        stats = self.injector.run_to_completion(self._turn_injection_request)
+        stats = self.injector.run_to_completion(request)
         injection_latency_s = time.monotonic() - t0
 
-        record.injection_strategy = "turn_injection (burst, fired on detected turn boundary)"
+        record.injection_strategy = strategy_label
         record.injected_token_count = stats.token_count
         record.injection_latency_s = injection_latency_s
         record.total_latency_s = injection_latency_s
@@ -318,25 +322,133 @@ class RAGSession:
 
         self.logger.log(record)
         return record.to_dict()
+
+    async def _fire_prepared_burst_async(self, request: InjectionRequest, query: Optional[str], strategy_label: str) -> dict:
+        """Async-checkpointed equivalent of `_fire_prepared_burst`, for `moshi.server`'s
+        `opus_loop` -- see `TokenInjector.run_to_completion_async`. Identical fields/logging."""
+        record = RequestLogRecord(mode=request.mode, user_query=query)
+        t0 = time.monotonic()
+        stats = await self.injector.run_to_completion_async(request)
+        injection_latency_s = time.monotonic() - t0
+
+        record.injection_strategy = strategy_label
+        record.injected_token_count = stats.token_count
+        record.injection_latency_s = injection_latency_s
+        record.total_latency_s = injection_latency_s
+        record.kv_cache_status = inspect_kv_cache(self._lm_gen)
+
+        self.logger.log(record)
+        return record.to_dict()
+
+    def fire_turn_injection_burst(self) -> dict:
+        """Mode D: fires the prepared turn-injection knowledge as ONE synchronous blocking burst
+        (same underlying mechanism as Mode C's `inject_persona_compatible_knowledge`), triggered
+        by a detected turn boundary instead of connection start. For `moshi.offline`; use
+        `fire_turn_injection_burst_async()` for the live server."""
+        return self._fire_prepared_burst(
+            self._turn_injection_request, self._turn_injection_query,
+            "turn_injection (burst, fired on detected turn boundary)",
+        )
 
     async def fire_turn_injection_burst_async(self) -> dict:
         """Async-checkpointed equivalent of `fire_turn_injection_burst`, for `moshi.server`'s
-        `opus_loop` -- see `TokenInjector.run_to_completion_async`. Identical fields/logging."""
-        record = RequestLogRecord(
-            mode=InjectionMode.TURN_INJECTION.value, user_query=self._turn_injection_query
+        `opus_loop`."""
+        return await self._fire_prepared_burst_async(
+            self._turn_injection_request, self._turn_injection_query,
+            "turn_injection (burst, fired on detected turn boundary)",
         )
+
+    # ---- Mode E: fixed-interval (time-based) burst injection, independent of turn boundaries -
+    #
+    # Per the Mode D finding (docs/MODE_C_IMPLEMENTATION_REPORT.md Section 8, real run on the RTX
+    # 5090 pod): wrapping a mid-call burst in `<system>...<system>` tags -- the same format used
+    # exactly once, at connection start, by `step_system_prompts` -- appears to read to the model
+    # as "a call is starting," causing it to abandon its sentence and re-greet instead of
+    # grounding in the injected facts. Mode E deliberately tests the same proven-safe burst
+    # mechanism WITHOUT that wrapping: a plain knowledge block, no `<system>` tags, no Mode-B-style
+    # "Relevant Knowledge:/User Question:" framing either (there is no specific question to frame
+    # against a periodic, conversation-state-independent re-fire). This isolates whether the
+    # `<system>` tag itself was the cause of Mode D's derailment.
+    def prepare_dynamic_injection_knowledge(self, query: str) -> dict:
+        """Mode E setup. Retrieves context for `query` once, using `config.dynamic_injection_top_k`
+        (same "keep it small" reasoning as Mode D's `turn_injection_top_k` -- repeated
+        mid-conversation injection must stay cheap; ~25ms/injected token measured for Mode B/C),
+        and holds a PLAIN (not `<system>`-wrapped) knowledge block ready to be re-fired as a burst
+        every `config.dynamic_injection_interval_s` seconds via `tick_dynamic_injection()` /
+        `fire_dynamic_injection_burst()`/`_async()`.
+
+        Starts the fixed-interval clock now -- the first re-fire happens
+        `dynamic_injection_interval_s` seconds after this call, not after the first tick. Does
+        not push anything through the model itself; call `finalize_and_log(record)` on the result
+        the same way as Mode C/B/D's setup methods.
+        """
+        record = RequestLogRecord(mode=InjectionMode.DYNAMIC_RUNTIME.value, user_query=query)
+
+        if not self.config.enable_rag or self.retriever is None:
+            record.injection_strategy = "skipped (RAG disabled or no index loaded)"
+            return record.to_dict()
+
         t0 = time.monotonic()
-        stats = await self.injector.run_to_completion_async(self._turn_injection_request)
-        injection_latency_s = time.monotonic() - t0
+        retrieval = self.retriever.retrieve_context(
+            query, top_k=self.config.dynamic_injection_top_k, score_threshold=self.config.score_threshold
+        )
+        record.retrieval_latency_s = time.monotonic() - t0
+        record.retrieved_contexts = retrieval["contexts"]
+        record.retrieved_scores = retrieval["scores"]
+        if not retrieval["contexts"]:
+            record.injection_strategy = "skipped (no contexts above score_threshold at dynamic_injection_top_k)"
+            return record.to_dict()
 
-        record.injection_strategy = "turn_injection (burst, fired on detected turn boundary)"
-        record.injected_token_count = stats.token_count
-        record.injection_latency_s = injection_latency_s
-        record.total_latency_s = injection_latency_s
-        record.kv_cache_status = inspect_kv_cache(self._lm_gen)
-
-        self.logger.log(record)
+        knowledge_block = "\n".join(retrieval["contexts"])
+        self._dynamic_injection_request = InjectionRequest(
+            text=knowledge_block, mode=InjectionMode.DYNAMIC_RUNTIME.value, wrap_system_tags=False
+        )
+        self._dynamic_injection_query = query
+        self._dynamic_injection_last_fire_time = time.monotonic()
+        record.injection_strategy = (
+            "dynamic_runtime (prepared, no <system> wrapping; re-fired as a burst every "
+            f"{self.config.dynamic_injection_interval_s}s)"
+        )
+        record.context_length_chars = len(knowledge_block)
+        record.prompt_length_chars = len(knowledge_block)  # no wrapping added for this mode
         return record.to_dict()
+
+    def tick_dynamic_injection(self) -> bool:
+        """Call once per real audio frame -- no-op (returns False) unless Mode E is active and
+        `prepare_dynamic_injection_knowledge()` has already armed a knowledge block, safe to call
+        unconditionally in any mode (same contract as `observe_user_frame()`).
+
+        Returns True iff `config.dynamic_injection_interval_s` has elapsed since the last fire (or
+        since `prepare_dynamic_injection_knowledge`, for the first one), and resets the internal
+        clock. Like `observe_user_frame()`, this only *detects* -- the caller must fire the burst
+        (`fire_dynamic_injection_burst()`/`_async()`) before processing the current frame any
+        further, so it always completes as a self-contained unit (the same interleaving hazard
+        documented for Mode D applies to any forced-token mechanism, not just D).
+        """
+        if self._dynamic_injection_request is None or self._dynamic_injection_last_fire_time is None:
+            return False
+        if time.monotonic() - self._dynamic_injection_last_fire_time < self.config.dynamic_injection_interval_s:
+            return False
+        self._dynamic_injection_last_fire_time = time.monotonic()
+        return True
+
+    def fire_dynamic_injection_burst(self) -> dict:
+        """Mode E: fires the prepared dynamic-injection knowledge as ONE synchronous blocking
+        burst (same mechanism as Mode D's `fire_turn_injection_burst`), triggered by a fixed
+        wall-clock interval instead of a detected pause. For `moshi.offline`; use
+        `fire_dynamic_injection_burst_async()` for the live server."""
+        return self._fire_prepared_burst(
+            self._dynamic_injection_request, self._dynamic_injection_query,
+            f"dynamic_runtime (burst, fired on {self.config.dynamic_injection_interval_s}s interval, no <system> wrapping)",
+        )
+
+    async def fire_dynamic_injection_burst_async(self) -> dict:
+        """Async-checkpointed equivalent of `fire_dynamic_injection_burst`, for `moshi.server`'s
+        `opus_loop`."""
+        return await self._fire_prepared_burst_async(
+            self._dynamic_injection_request, self._dynamic_injection_query,
+            f"dynamic_runtime (burst, fired on {self.config.dynamic_injection_interval_s}s interval, no <system> wrapping)",
+        )
 
     def finalize_and_log(
         self,

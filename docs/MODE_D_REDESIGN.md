@@ -89,8 +89,20 @@ mirrors that exact pattern.
 
 ## Status
 
-Not yet re-run against the real model. Next step: re-run the notebook's Run 4 (Mode D) cell on the
-RunPod pod and confirm the transcript no longer contains raw `<system>` tags or verbatim KB text --
-the agent should either naturally pause-then-continue around the burst, or (more likely, given
-Mode C's behavior) pick up the topic the same way Mode C did, just triggered mid-call instead of
-upfront.
+Re-run against the real model on the RTX 5090 pod. The fix worked exactly as designed: no raw
+`<system>` tags or verbatim KB text appeared in the transcript -- the burst is correctly invisible
+to the transcript, the same way Mode C/B's connection-start burst is.
+
+However, a different problem appeared once the leak was gone: the model abandoned its in-progress
+sentence and re-sampled a fresh greeting right at the burst point, instead of continuing or
+grounding in the injected facts. Working hypothesis: wrapping the burst in `<system>...<system>`
+tags (the same format used exactly once, at connection start, by `step_system_prompts`) is
+plausibly read by the model as "a call is starting" when forced mid-call, since that is the only
+context it ever saw that pattern in. See `docs/MODE_C_IMPLEMENTATION_REPORT.md` Section 8 for the
+full real-run transcript evidence and analysis.
+
+Per instruction, this has been recorded as a documented limitation rather than pursued further --
+Mode D is concluded at "corruption-free, but derails instead of grounding." Any future per-turn or
+periodic injection design (Modes E/F) should treat the `<system>`-tag-mid-call pattern as a known
+risk to test for explicitly, not assume it's safe just because Mode C/B's connection-start use of
+the same tags works.

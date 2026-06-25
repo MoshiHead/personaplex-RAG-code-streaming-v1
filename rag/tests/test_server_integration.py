@@ -8,6 +8,7 @@ dependencies being installed.
 import asyncio
 import shutil
 import tempfile
+import time
 import unittest
 
 import numpy as np
@@ -467,6 +468,171 @@ class TestRAGSessionModeDAsyncBurst(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
 
         await asyncio.gather(session.fire_turn_injection_burst_async(), other_task())
+        self.assertEqual(other_task_ticks, [0, 1, 2, 3, 4])
+
+
+class TestRAGSessionModeE(unittest.TestCase):
+    """Mode E: fixed wall-clock-interval BURST injection, independent of detected turn boundaries.
+
+    Deliberately does NOT wrap the burst in <system> tags (unlike Mode D) -- see the module-level
+    comment above `RAGSession.prepare_dynamic_injection_knowledge` and
+    docs/MODE_C_IMPLEMENTATION_REPORT.md Section 8 for why: Mode D's real-run result showed
+    <system>-wrapped mid-call bursts cause the model to re-greet instead of grounding."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.config = RAGConfig(
+            enable_rag=True,
+            injection_mode=InjectionMode.DYNAMIC_RUNTIME,
+            dynamic_injection_interval_s=1.0,
+            dynamic_injection_top_k=2,
+            log_dir=self.tmp_dir,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_tick_is_a_noop_before_knowledge_is_prepared(self):
+        session, lm_gen = _make_session(self.config, self.tmp_dir)
+        self.assertFalse(session.tick_dynamic_injection())
+        self.assertEqual(len(lm_gen.calls), 0)
+
+    def test_tick_returns_false_before_the_interval_elapses(self):
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.DYNAMIC_RUNTIME,
+            dynamic_injection_interval_s=10.0, log_dir=self.tmp_dir,
+        )
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_dynamic_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        self.assertFalse(session.tick_dynamic_injection())
+        self.assertEqual(len(lm_gen.calls), 0)
+
+    def test_tick_returns_true_once_the_interval_elapses_but_does_not_inject_itself(self):
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.DYNAMIC_RUNTIME,
+            dynamic_injection_interval_s=0.01, log_dir=self.tmp_dir,
+        )
+        retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_dynamic_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        time.sleep(0.02)
+        self.assertTrue(session.tick_dynamic_injection())
+        # Detecting the elapsed interval must not, by itself, force anything through the model --
+        # only fire_dynamic_injection_burst()/_async() does that.
+        self.assertEqual(len(lm_gen.calls), 0)
+
+    def test_prepare_uses_dynamic_injection_top_k_not_top_k(self):
+        seen_top_k = []
+
+        class RecordingRetriever(FakeRetriever):
+            def retrieve_context(self, query, top_k=5, score_threshold=None, metadata_filter=None):
+                seen_top_k.append(top_k)
+                return super().retrieve_context(query, top_k, score_threshold, metadata_filter)
+
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.DYNAMIC_RUNTIME,
+            top_k=5, dynamic_injection_top_k=2, log_dir=self.tmp_dir,
+        )
+        retriever = RecordingRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
+        session, _ = _make_session(config, self.tmp_dir, retriever=retriever)
+        session.prepare_dynamic_injection_knowledge("a question")
+
+        self.assertEqual(seen_top_k, [2])
+
+    def test_fire_dynamic_injection_burst_forces_tokens_without_system_wrapping(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["ab"], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_dynamic_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        result = session.fire_dynamic_injection_burst()
+
+        self.assertEqual(result["mode"], "dynamic_runtime")
+        self.assertIn("dynamic_runtime (burst", result["injection_strategy"])
+        self.assertIn("no <system> wrapping", result["injection_strategy"])
+        self.assertGreater(len(lm_gen.calls), 0)
+        self.assertEqual(result["injected_token_count"], len(lm_gen.calls))
+        self.assertFalse(lm_gen.reset_streaming_called)
+
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertNotIn("<system>", forced_text)
+        self.assertEqual(forced_text, "ab")
+
+        rows = session.logger.read_all()
+        burst_rows = [r for r in rows if r["injection_strategy"].startswith("dynamic_runtime (burst")]
+        self.assertEqual(len(burst_rows), 1)
+
+    def test_can_fire_again_after_a_later_interval_elapses(self):
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.DYNAMIC_RUNTIME,
+            dynamic_injection_interval_s=0.01, log_dir=self.tmp_dir,
+        )
+        retriever = FakeRetriever({"query": "q", "contexts": ["x"], "scores": [0.9]})
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_dynamic_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        time.sleep(0.02)
+        self.assertTrue(session.tick_dynamic_injection())
+        session.fire_dynamic_injection_burst()
+        first_cycle_calls = len(lm_gen.calls)
+
+        time.sleep(0.02)
+        self.assertTrue(session.tick_dynamic_injection())
+        session.fire_dynamic_injection_burst()
+        self.assertGreater(len(lm_gen.calls), first_cycle_calls)
+
+        rows = session.logger.read_all()
+        burst_rows = [r for r in rows if r["injection_strategy"].startswith("dynamic_runtime (burst")]
+        self.assertEqual(len(burst_rows), 2)
+
+
+class TestRAGSessionModeEAsyncBurst(unittest.IsolatedAsyncioTestCase):
+    """Async-checkpointed equivalent of the burst, for moshi.server's opus_loop."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.DYNAMIC_RUNTIME,
+            dynamic_injection_interval_s=1.0, dynamic_injection_top_k=2, log_dir=self.tmp_dir,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    async def test_async_burst_forces_tokens_without_system_wrapping(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.9]})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_dynamic_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        result = await session.fire_dynamic_injection_burst_async()
+
+        self.assertIn("dynamic_runtime (burst", result["injection_strategy"])
+        self.assertGreater(len(lm_gen.calls), 0)
+        self.assertFalse(lm_gen.reset_streaming_called)
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertNotIn("<system>", forced_text)
+
+    async def test_async_burst_does_not_starve_other_coroutines(self):
+        retriever = FakeRetriever({"query": "q", "contexts": ["a somewhat longer fact to inject here"], "scores": [0.9]})
+        session, _ = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        record = session.prepare_dynamic_injection_knowledge("a question")
+        session.finalize_and_log(record)
+
+        other_task_ticks = []
+
+        async def other_task():
+            for i in range(5):
+                other_task_ticks.append(i)
+                await asyncio.sleep(0)
+
+        await asyncio.gather(session.fire_dynamic_injection_burst_async(), other_task())
         self.assertEqual(other_task_ticks, [0, 1, 2, 3, 4])
 
 
